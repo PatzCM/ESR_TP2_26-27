@@ -69,6 +69,31 @@ class UdpTransport:
             pass
 
 
+class OverlayTransport:
+    """Sends one stream's packets through the overlay (Joao's Router).
+
+    Used by ott.py on a server node: StreamSender calls send(data) and the
+    router replicates the packet along the active routes. Receiving on a
+    client node doesn't need this class: ott.py passes the router's on_data
+    callback straight to client.Receiver.on_data.
+
+    `lock` must be the same lock the node uses for every router call
+    (the Router is not thread-safe, see INTERFACES.md section 3).
+    """
+
+    def __init__(self, router, lock, stream):
+        self.router = router
+        self.lock = lock
+        self.stream = stream      # e.g. "Server1/video1"
+
+    def send(self, data):
+        with self.lock:
+            self.router.enviar_dados(self.stream, data)   # send_data after the rename
+
+    def close(self):
+        pass
+
+
 def parse_address(text, default_port):
     """'10.0.0.2:25000' -> ('10.0.0.2', 25000);  '10.0.0.2' -> ('10.0.0.2', default)."""
     if ":" in text:

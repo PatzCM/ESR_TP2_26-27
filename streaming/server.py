@@ -86,7 +86,7 @@ def parse_stream(text):
 
 def main():
     ap = argparse.ArgumentParser(description="OTT streaming server")
-    ap.add_argument("--id", default="S1", help="server name, max 8 chars (default S1)")
+    ap.add_argument("--id", default="S1", help="server ID, max 16 chars; use the server IP, e.g. 10.0.0.20 (default S1)")
     ap.add_argument("--stream", action="append", type=parse_stream,
                     metavar="ID:FILE", help="stream to offer (repeatable)")
     ap.add_argument("--to", action="append", metavar="IP[:PORT]",
