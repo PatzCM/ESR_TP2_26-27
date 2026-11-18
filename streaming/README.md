@@ -10,7 +10,7 @@ The server reads a video, cuts it into packets, and sends them. The client recei
     │ video_stream.py: read 1 picture (frame)            ▲
     ▼                                                    │ client.py: show 20 per second
  frame (~8 KB)                                        frame
-    │ packet.py: cut into ~1.4 KB pieces                 ▲ packet.py: glue the pieces back
+    │ packet.py: cut into ~1.3 KB pieces                 ▲ packet.py: glue the pieces back
     ▼                                                    │
  packets ── transport.py ──► network / overlay ──► transport.py
 ```
@@ -54,22 +54,22 @@ Options: `--fps` (speed), `--buffer` (frames to wait for before playing), `-v` (
 
 ## Packet format (for the report and for João)
 
-34-byte header followed by the video data (all numbers in network byte order):
+42-byte header followed by the video data (all numbers in network byte order):
 
 | Bytes | Field | Example |
 |---|---|---|
 | 4 | magic `OTTV` | marks "this is a video packet" |
 | 1 | version | 1 |
 | 1 | type | 1 = video |
-| 8 | server_id | `S1` |
+| 16 | server_id | `10.0.0.20` (server IP, as in `INTERFACES.md`) |
 | 2 | stream_id | 2 |
 | 4 | seq (frame number) | 137 |
 | 2 | frag_index | 0, 1, 2… |
 | 2 | frag_count | 6 |
 | 8 | timestamp (ms) | used to measure delay |
-| 2 | payload_len | ≤ 1400 |
+| 2 | payload_len | ≤ 1300 |
 
-João's nodes **don't need to open the packet**. They only read `server_id` and `stream_id` (bytes 6 to 15) to look up the route and copy the packet to the right neighbours.
+João's router **never opens this packet**. It treats the whole thing as an opaque `payload` and wraps it in its own envelope, `DATA|<stream>|<from>|<payload>` (see `INTERFACES.md` on the `Sousa` branch). Our header is only read by our client.
 
 ## What to agree with Pedro and João
 
