@@ -4,24 +4,25 @@ packet.py - Format of a video packet, and how frames are split / rebuilt.
 WHY WE SPLIT FRAMES
 -------------------
 A frame of movie.Mjpeg is 5 000 - 14 000 bytes, but one network packet can
-only carry about 1 400 bytes safely. So each frame is cut into pieces
+only carry about 1 300 bytes safely. So each frame is cut into pieces
 ("fragments"), each piece is sent in its own packet, and the client glues the
 pieces back together.
 
-PACKET FORMAT  (34-byte header + data)
+PACKET FORMAT  (42-byte header + data)
 --------------------------------------
  offset size  field         meaning
    0     4    magic         always b"OTTV" -> "this is one of our video packets"
    4     1    version       format version (1)
    5     1    type          1 = video data
-   6     8    server_id     who sent it, e.g. "S1" (padded with zeros)
-  14     2    stream_id     which video of that server, e.g. 1 or 2
-  16     4    seq           frame number (1, 2, 3, ...)
-  20     2    frag_index    which piece of the frame this is (0, 1, 2, ...)
-  22     2    frag_count    how many pieces this frame has in total
-  24     8    timestamp_ms  when the server sent it (milliseconds)
-  32     2    payload_len   how many bytes of data follow
-  34     ...  payload       a piece of the JPEG picture
+   6    16    server_id     who sent it: the server's IP, e.g. "10.0.0.20"
+                            (16 chars fits any IPv4 address; padded with zeros)
+  22     2    stream_id     which video of that server, e.g. 1 or 2
+  24     4    seq           frame number (1, 2, 3, ...)
+  28     2    frag_index    which piece of the frame this is (0, 1, 2, ...)
+  30     2    frag_count    how many pieces this frame has in total
+  32     8    timestamp_ms  when the server sent it (milliseconds)
+  40     2    payload_len   how many bytes of data follow
+  42     ...  payload       a piece of the JPEG picture
 
 (Checklist Fase 4: server id, stream id, sequence number, data,
  split when needed, rebuild at the destination.)
@@ -34,9 +35,10 @@ MAGIC = b"OTTV"
 VERSION = 1
 TYPE_VIDEO = 1
 
-HEADER_FORMAT = "!4sBB8sHIHHQH"           # "!" = network byte order
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 34
-MAX_PAYLOAD = 1400                          # bytes of video per packet
+HEADER_FORMAT = "!4sBB16sHIHHQH"           # "!" = network byte order
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 42
+MAX_PAYLOAD = 1300   # bytes of video per packet. 1300 + our 42 + router "DATA|..." ~32
+                     # + UDP/IP 28 stays under the 1500-byte limit of a link
 
 
 class VideoPacket:
@@ -53,7 +55,9 @@ class VideoPacket:
 
     # -- turn the object into bytes (to send) ------------------------------
     def encode(self):
-        sid = self.server_id.encode("ascii")[:8]
+        sid = self.server_id.encode("ascii")
+        if len(sid) > 16:
+            raise ValueError("server_id too long (max 16 chars): %r" % self.server_id)
         header = struct.pack(HEADER_FORMAT, MAGIC, VERSION, TYPE_VIDEO, sid,
                              self.stream_id, self.seq, self.frag_index,
                              self.frag_count, self.timestamp_ms,
