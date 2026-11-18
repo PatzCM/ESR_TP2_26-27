@@ -108,4 +108,20 @@
     <configuration name="hidden" value="[]"/>
     <configuration name="canvas" value="{&quot;gridlines&quot;: true, &quot;canvases&quot;: [{&quot;id&quot;: 1, &quot;wallpaper&quot;: null, &quot;wallpaper_style&quot;: 1, &quot;fit_image&quot;: false, &quot;dimensions&quot;: [1000, 750]}]}"/>
   </session_metadata>
+  <session_hooks>
+    <hook name="frr_ospf_fix.sh" state="4">#!/bin/sh
+# Machines with FRR instead of Quagga: CORE's Quagga services start the
+# routers with OSPF switched off. Load the settings CORE generated into FRR.
+# Does nothing on machines that run Quagga.
+vtysh --version 2&gt;/dev/null | grep -q FRRouting || exit 0
+(
+  sleep 2
+  for ctl in ./*; do
+    [ -S "$ctl" ] || continue
+    vcmd -c "$ctl" -- sh -c 'test -f /usr/local/etc/quagga/Quagga.conf || exit 0; for i in 1 2 3 4 5; do vtysh -f /usr/local/etc/quagga/Quagga.conf; vtysh -c "show ip ospf" &gt;/dev/null 2&gt;&amp;1 &amp;&amp; break; sleep 1; done' &gt;/dev/null 2&gt;&amp;1
+  done
+) &gt;/dev/null 2&gt;&amp;1 &amp;
+exit 0
+</hook>
+  </session_hooks>
 </scenario>
