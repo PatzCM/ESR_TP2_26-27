@@ -1,0 +1,13 @@
+{
+  "min_degree": 1,
+  "nodes": {
+    "Server":  {"ip": "10.0.0.20", "port": 5000},
+    "Node":    {"ip": "10.0.0.1",  "port": 5000},
+    "Client1": {"ip": "10.0.1.20", "port": 5000},
+    "Client2": {"ip": "10.0.2.20", "port": 5000}
+  },
+  "links": {
+    "Server": ["Node"],
+    "Node":   ["Client1", "Client2"]
+  }
+}
