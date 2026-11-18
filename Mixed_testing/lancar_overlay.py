@@ -141,7 +141,7 @@ def main():
     ap.add_argument("cenario", help="ficheiro JSON do cenário (ex: cenario2.json)")
     ap.add_argument("nos", nargs="*", help="nós a que se aplica (por omissão todos)")
     ap.add_argument("-f", dest="seguir", action="store_true", help="logs: seguir em direto")
-    ap.add_argument("--script", default=os.path.join(AQUI, "no_ott.py"), help="caminho do no_ott.py")
+    ap.add_argument("--script", default=os.path.join(AQUI, "no_ott_mixed.py"), help="caminho do no_ott_mixed.py")
     ap.add_argument("--logs", default=os.path.join(AQUI, "logs"), help="pasta dos logs e pids")
     ap.add_argument("--sessao", help="pasta da sessão CORE (por omissão a mais recente em /tmp/pycore.*)")
     ap.add_argument("--bootstrapper", default="Server", help="ID do bootstrapper (por omissão Server)")
