@@ -1,10 +1,12 @@
 """Testes sem rede real: topologias simuladas em memoria (Cenario 2 e Cenario final).
 Correr (dentro de routing/):  python3 -m unittest -v test_routing
 """
+import heapq
+import itertools
 import json
 import os
 import unittest
-from collections import Counter, deque
+from collections import Counter
 
 from router import Router
 
@@ -12,10 +14,12 @@ S1 = "S/v1"
 
 
 class Rede:
-    def __init__(self, links, servidores=None, streams=None):
+    def __init__(self, links, servidores=None, streams=None, metric="delay"):
         self.t = 0.0
         self.links = {frozenset(l) for l in links}
-        self.fila = deque()
+        self.atraso = {}                       # frozenset(link) -> atraso num sentido (s)
+        self.fila = []                         # heap (hora_entrega, n, destino, bytes)
+        self._n = itertools.count()
         self.dados_enviados = Counter()
         self.recebidos = {}
         ids = {x for l in links for x in l}
@@ -26,7 +30,7 @@ class Rede:
                 i, (lambda d, b, i=i: self._env(i, d, b)), (lambda i=i: self._viz(i)),
                 server_streams=(streams or {}).get(i, ()),
                 on_data=(lambda s, p, i=i: self.recebidos[i].append(p)),
-                clock=lambda: self.t)
+                clock=lambda: self.t, metric=metric)
 
     def _viz(self, i):
         return [x for l in self.links for x in l if i in l and x != i]
@@ -35,12 +39,22 @@ class Rede:
         if frozenset((src, dst)) in self.links:
             if b.startswith(b"DATA|"):
                 self.dados_enviados[(src, dst)] += 1
-            self.fila.append((dst, b))
+            hora = self.t + self.atraso.get(frozenset((src, dst)), 0.0)
+            heapq.heappush(self.fila, (hora, next(self._n), dst, b))
 
     def drenar(self):
-        while self.fila:
-            dst, b = self.fila.popleft()
+        """Entrega tudo o que ja chegou (hora de entrega <= agora)."""
+        while self.fila and self.fila[0][0] <= self.t:
+            _, _, dst, b = heapq.heappop(self.fila)
             self.nos[dst].on_receive(b)
+
+    def correr(self, segundos, dt=0.005):
+        """Avanca o tempo em passos pequenos (para medir atrasos)."""
+        for _ in range(int(round(segundos / dt))):
+            self.t += dt
+            for r in self.nos.values():
+                r.tick()
+            self.drenar()
 
     def passo(self, dt=1.0, n=1):
         for _ in range(n):
@@ -187,13 +201,14 @@ class TestRouting(unittest.TestCase):
 
 
 def cenario_final():
-    """Topologia de Mixed_testing/cenarioF.json. Servidores n16 e n19 (escolha do teste),
-    cada um com 2 streams."""
+    """Topologia de Mixed_testing/cenarioF.json. Como na figura 1 do enunciado, S1 = n16
+    e os clientes sao n17, n18, n19, n22, n23; o 2.o servidor (n20) e escolha nossa.
+    Cada servidor tem 2 streams."""
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Mixed_testing", "cenarioF.json")
     with open(p) as f:
         cfg = json.load(f)
     links = [(a, b) for a, vs in cfg["links"].items() for b in vs]
-    streams = {"n16": ["n16/video1", "n16/video2"], "n19": ["n19/video1", "n19/video2"]}
+    streams = {"n16": ["n16/video1", "n16/video2"], "n20": ["n20/video1", "n20/video2"]}
     return Rede(links, streams=streams)
 
 
@@ -203,24 +218,25 @@ class TestVariosServidores(unittest.TestCase):
         r.passo(1, 3)
         for n in ("n5", "n10", "n23"):
             self.assertEqual(sorted(r.nos[n].t.rotas),
-                             ["n16/video1", "n16/video2", "n19/video1", "n19/video2"])
+                             ["n16/video1", "n16/video2", "n20/video1", "n20/video2"])
         self.assertEqual(r.nos["n10"].t.obter("n16/video1").metrica, 1)
-        self.assertEqual(r.nos["n1"].t.obter("n19/video2").metrica, 1)
+        self.assertEqual(r.nos["n1"].t.obter("n20/video2").metrica, 1)
 
     def test_clientes_com_streams_diferentes_em_simultaneo(self):
         r = cenario_final()
         r.passo(1, 3)
-        pedidos = {"n17": "n16/video1", "n21": "n16/video2", "n23": "n19/video1", "n24": "n16/video1"}
+        pedidos = {"n17": "n16/video1", "n18": "n16/video2", "n19": "n20/video1",
+                   "n22": "n16/video1", "n23": "n20/video1"}
         for c, s in pedidos.items():
             r.nos[c].request_stream(s)
         r.drenar()
-        for s in ("n16/video1", "n16/video2", "n19/video1", "n19/video2"):
+        for s in ("n16/video1", "n16/video2", "n20/video1", "n20/video2"):
             r.nos[s.split("/")[0]].send_data(s, s.encode())
         r.drenar()
         for c, s in pedidos.items():
             self.assertEqual(r.recebidos[c], [s.encode()], c)
-        # ninguem pediu n19/video2: nao sai nenhum pacote do servidor para essa stream
-        self.assertEqual(r.recebidos["n20"], [])
+        # ninguem pediu n20/video2: nao ha trafego dessa stream
+        self.assertFalse(r.nos["n1"].t.obter("n20/video2").ativa)
         # cada link leva no maximo 1 copia de cada stream
         total = sum(r.dados_enviados.values())
         self.assertLessEqual(max(r.dados_enviados.values()), 3)
@@ -241,6 +257,66 @@ class TestVariosServidores(unittest.TestCase):
         r.nos["n16"].send_data("n16/video1", b"depois")
         r.drenar()
         self.assertEqual(r.recebidos["n23"], [b"depois"])    # via n9-n6-n5
+
+
+
+class TestMetricaAtraso(unittest.TestCase):
+    """Etapa 2 / requisito "metricas da rede": custo = atraso medido + 1 ms por salto."""
+
+    def test_sem_atraso_equivale_a_saltos(self):
+        r = cenario2()
+        r.correr(3)
+        self.assertAlmostEqual(r.nos["C1"].t.obter(S1).metrica, 3, places=1)
+
+    def test_mede_atraso_de_cada_ligacao(self):
+        r = cenario2()
+        r.atraso[frozenset(("N1", "N2"))] = 0.040           # 40 ms
+        r.correr(4)
+        # o simulador entrega em passos de 5 ms, por isso a medida sai por excesso
+        self.assertAlmostEqual(r.nos["N2"].link_delay("N1"), 40, delta=6)
+        self.assertAlmostEqual(r.nos["N2"].link_delay("N3"), 0, delta=2)
+        self.assertIn("N1=", r.nos["N2"].dump())
+
+    def test_evita_ligacao_lenta(self):
+        r = cenario2()
+        r.atraso[frozenset(("N1", "N2"))] = 0.050           # caminho curto mas lento
+        r.correr(12)                                         # medir + 2 rondas de ANNOUNCE
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N3")   # S-N1-N3-N2-C1
+        r.nos["C1"].request_stream(S1)
+        r.correr(0.5)
+        r.nos["S"].send_data(S1, b"f")
+        r.correr(0.5)
+        self.assertEqual(r.recebidos["C1"], [b"f"])
+        self.assertEqual(r.dados_enviados[("N1", "N2")], 0)
+
+    def test_reage_a_mudanca_das_condicoes(self):
+        r = cenario2()
+        r.nos["C1"].request_stream(S1)
+        r.correr(8)
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")
+        r.atraso[frozenset(("N1", "N2"))] = 0.050           # a ligacao fica lenta a meio
+        r.correr(15)
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N3")
+        self.assertEqual(r.nos["N2"].t.obter(S1).upstream, "N3")  # ACTIVATE seguiu o novo caminho
+        del r.atraso[frozenset(("N1", "N2"))]                # volta ao normal
+        r.correr(20)
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")
+
+    def test_histerese_ignora_diferencas_pequenas(self):
+        r = cenario2()
+        r.correr(8)
+        rota = r.nos["N2"].t.obter(S1)
+        self.assertEqual(rota.origem, "N1")
+        # N3 passa a parecer 0,1 ms melhor (ruido): nao deve trocar
+        rota.candidatos["N3"] = (rota.metrica - 0.1, r.t)
+        r.nos["N2"].t._escolher(rota)
+        self.assertEqual(rota.origem, "N1")
+
+    def test_modo_saltos_continua_disponivel(self):
+        r = Rede([("S", "N1"), ("N1", "C")], streams={"S": [S1]}, metric="hops")
+        r.passo(1, 3)
+        self.assertEqual(r.nos["C"].t.obter(S1).metrica, 2)
+        self.assertIsInstance(r.nos["C"].t.obter(S1).metrica, int)
 
 
 if __name__ == "__main__":

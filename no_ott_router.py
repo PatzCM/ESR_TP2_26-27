@@ -10,6 +10,7 @@ Usage: python3 no_ott_router.py --id NAME [--port 5000] [--neighbors ID=IP:PORT 
   --watch STREAM       this node wants to receive STREAM (repeatable)
   --ping               (server) sends a PING every 5 s
   --bind IP            default 0.0.0.0 (only change for local tests)
+  --metric delay|hops  routing metric (default: measured delay + 1 ms per hop)
 
 Console:
   routes        show this node's routing table
@@ -43,6 +44,7 @@ ap.add_argument("--serve", action="append", default=[], metavar="VIDEO")
 ap.add_argument("--watch", action="append", default=[], metavar="STREAM")
 ap.add_argument("--ping", action="store_true")
 ap.add_argument("--bind", default="0.0.0.0")
+ap.add_argument("--metric", choices=("delay", "hops"), default="delay")
 args = ap.parse_args()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s",
@@ -75,7 +77,7 @@ def on_data(stream, payload):
 
 STREAMS = [f"{args.id}/{v}" for v in args.serve]
 router = Router(args.id, send, lambda: list(ADDRESS),
-                server_streams=STREAMS, on_data=on_data)
+                server_streams=STREAMS, on_data=on_data, metric=args.metric)
 
 
 def receive():

@@ -49,11 +49,15 @@ One JSON object per UDP datagram. **Every message has `type` and `from`.**
 | `ACTIVATE` | client → towards server | `type, from, stream` |
 | `DEACTIVATE` | client → towards server | `type, from, stream` |
 | `PING` | server → along active routes | `type, from, stream, path` (list of node IDs it went through) |
+| `PROBE` | node → each neighbour | `type, from, t` (sender's own clock, ms) |
+| `PROBE_REPLY` | neighbour → node | `type, from, t` (the same `t`, echoed back) |
+
+- `metric` is the route cost. Default (`--metric delay`): sum over the links of (one-way delay in ms + 1 ms per hop). The delay of a link is half the smoothed RTT of `PROBE`/`PROBE_REPLY`. With `--metric hops` it is the hop count (an integer).
 
 Examples:
 ```json
 {"type": "REGISTER", "from": "Node1", "port": 5000}
-{"type": "ANNOUNCE", "from": "Node1", "stream": "Server1/video1", "server": "Server1", "metric": 2, "seq": 17}
+{"type": "ANNOUNCE", "from": "Node1", "stream": "Server1/video1", "server": "Server1", "metric": 2.31, "seq": 17}
 {"type": "ACTIVATE", "from": "Client1", "stream": "Server1/video1"}
 ```
 
@@ -68,7 +72,8 @@ The router never looks inside `payload`. The streaming module puts its video pac
 ### How a node sorts what it receives
 ```
 datagram starts with b"DATA|"                     -> router.on_receive(data)
-JSON with type ANNOUNCE/ACTIVATE/DEACTIVATE/PING  -> router.on_receive(data)
+JSON with type in router.ROUTING_TYPES            -> router.on_receive(data)
+  (ANNOUNCE, ACTIVATE, DEACTIVATE, PING, PROBE, PROBE_REPLY)
 any other JSON type                               -> overlay handlers (Pedro)
 ```
 Receive buffer: at least **2048 bytes** (recommended 65535). A video datagram is about 1.4 KB.
@@ -97,7 +102,7 @@ Receive buffer: at least **2048 bytes** (recommended 65535). A video datagram is
 | `Router(..., on_data=fn)` → `fn(stream, payload)` | client | Called for every video packet that reaches this node. |
 | `router.dump() -> str` | any | Routing table as text (console `routes` command). |
 
-Constructor: `Router(node_id, send, neighbors, server_streams=[...], on_data=fn)`.
+Constructor: `Router(node_id, send, neighbors, server_streams=[...], on_data=fn, metric="delay")`.
 
 ### One lock per node
 The `Router` is **not thread-safe**: it can't safely handle two calls at the same moment. Each node program creates **one** `threading.RLock()` and holds it around **every** call to the router: the receive thread, the `tick()` thread, and the streaming server's sending threads.
@@ -112,6 +117,7 @@ The `Router` is **not thread-safe**: it can't safely handle two calls at the sam
 | Bootstrapper forgets a node after no REGISTER | 15 s | overlay |
 | REGISTER attempts at start-up | 3 × 2 s, then use the manual neighbours | overlay |
 | Server ANNOUNCE | 5 s | routing |
+| Link delay PROBE | 1 s | routing |
 | ACTIVATE refresh | 2 s | routing |
 | Destination expires without refresh | 6 s | routing |
 | Route expires without ANNOUNCE | 15 s | routing |

@@ -9,6 +9,10 @@ import time
 LOCAL = "LOCAL"  # destino especial: a aplicacao cliente deste proprio no
 
 
+def _fmt(x):
+    return round(x, 2) if isinstance(x, float) else x
+
+
 class Rota:
     def __init__(self, stream, servidor=None):
         self.stream = stream
@@ -39,13 +43,17 @@ class Rota:
 
     def __repr__(self):
         return (f"{{Fluxo: {self.stream}, Origem: {self.origem}, "
-                f"Metrica: {self.metrica}, Destinos: {sorted(self.destinos)}, "
+                f"Metrica: {_fmt(self.metrica)}, Destinos: {sorted(self.destinos)}, "
                 f"Estado: {self.estado}}}")
 
 
 class TabelaRotas:
-    def __init__(self, timeout_rota=15.0, timeout_destino=6.0, relogio=time.monotonic):
+    def __init__(self, timeout_rota=15.0, timeout_destino=6.0, relogio=time.monotonic,
+                 histerese=0.0):
+        """histerese: so troca de origem se a nova for melhor em mais do que esta
+        fracao do custo atual (0.1 = 10%). Evita oscilar com o ruido das medicoes."""
         self.rotas = {}
+        self.histerese = histerese
         self.timeout_rota = timeout_rota
         self.timeout_destino = timeout_destino
         self.agora = relogio
@@ -67,12 +75,13 @@ class TabelaRotas:
 
     # ---------- escolha da origem ----------
     def _escolher(self, r):
-        """Escolhe a origem de menor custo; mantem a atual em caso de empate
-        (evita oscilacoes). Devolve True se a origem mudou."""
+        """Escolhe a origem de menor custo; mantem a atual em caso de empate ou
+        se a melhoria for menor do que a histerese. Devolve True se a origem mudou."""
         antiga = r.origem
         if r.candidatos:
             melhor = min(c for c, _ in r.candidatos.values())
-            if antiga in r.candidatos and r.candidatos[antiga][0] == melhor:
+            atual = r.candidatos[antiga][0] if antiga in r.candidatos else None
+            if atual is not None and (atual == melhor or melhor >= atual * (1 - self.histerese)):
                 nova = antiga
             else:
                 nova = min(v for v, (c, _) in r.candidatos.items() if c == melhor)
@@ -82,14 +91,16 @@ class TabelaRotas:
         return nova != antiga
 
     # ---------- anuncios ----------
-    def anuncio(self, stream, servidor, vizinho, metrica_vizinho, seq):
+    def anuncio(self, stream, servidor, vizinho, metrica_vizinho, seq, custo_link=1):
         """Processa um ANNOUNCE recebido de `vizinho`.
+        custo = metrica anunciada pelo vizinho + custo da ligacao ate ele
+        (1 em modo saltos; atraso medido + penalizacao por salto em modo atraso).
         Devolve (reenviar, custo_a_anunciar).
         Reenvia se for a 1a copia desta ronda (seq) ou se melhora o custo."""
         r = self._get(stream)
         if r.local or seq < r.seq:
             return False, r.metrica
-        custo = metrica_vizinho + 1
+        custo = metrica_vizinho + custo_link
         r.servidor = servidor
         r.candidatos[vizinho] = (custo, self.agora())
         self._escolher(r)
