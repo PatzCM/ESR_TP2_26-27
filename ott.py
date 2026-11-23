@@ -19,9 +19,9 @@ EXAMPLES (CORE, Cenario 1; names and IPs from Mixed_testing/cenario1.json)
 
 CONSOLE (nodes that are not playing video): neighbors | routes | ping | quit
 
-How the pieces are wired is described in INTERFACES.md. This file uses the
-CURRENT names in Pedro's and Joao's code (enviar_dados, on_vizinho_caiu, ...);
-update them here when the English renames from INTERFACES.md land.
+How the pieces are wired is described in INTERFACES.md. The router calls use
+the English names from INTERFACES.md section 3; Pedro's overlay still uses its
+current names (estado, ativo, ...) until his renames land.
 """
 import argparse
 import json
@@ -57,8 +57,8 @@ class OttNode:
             self.served["%s/%s" % (args.id, name)] = path
 
         self.router = Router(args.id, self.send, self.neighbors,
-                             streams_servidor=list(self.served),
-                             on_dados=self.on_data)
+                             server_streams=list(self.served),
+                             on_data=self.on_data)
 
     # ---- what the overlay gives the router (INTERFACES.md section 3)
     def send(self, to, data):
@@ -95,12 +95,12 @@ class OttNode:
             try:
                 if data.startswith(b"DATA|"):
                     with self.lock:
-                        self.router.on_receber(data)
+                        self.router.on_receive(data)
                     continue
                 msg = json.loads(data)
-                if msg.get("t") in ROUTING_TYPES or msg.get("type") in ROUTING_TYPES:
+                if msg.get("type") in ROUTING_TYPES:
                     with self.lock:
-                        self.router.on_receber(data)
+                        self.router.on_receive(data)
                 elif msg.get("type") in handlers:
                     handlers[msg["type"]](msg, addr)
             except Exception as e:                      # one bad packet must not kill the node
@@ -113,7 +113,7 @@ class OttNode:
             now = set(self.neighbors())
             with self.lock:
                 for gone in alive - now:
-                    self.router.on_vizinho_caiu(gone)
+                    self.router.on_neighbor_down(gone)
                 self.router.tick()
             alive = now
             self.node.parar.wait(0.2)
@@ -146,7 +146,7 @@ class OttNode:
         if a.watch:
             self.receiver = player.Receiver(None, None, a.buffer)
             with self.lock:
-                self.router.pedir_stream(a.watch)
+                self.router.request_stream(a.watch)
             n.log("STREAM", "requested %s" % a.watch)
 
     def console(self):
@@ -163,7 +163,7 @@ class OttNode:
                 self.node.mostrar_vizinhos()
             elif line == "routes":
                 with self.lock:
-                    print(self.router.t.dump() or "(no routes)")
+                    print(self.router.dump() or "(no routes)")
             elif line == "ping":
                 with self.lock:
                     for s in self.served:
@@ -175,7 +175,7 @@ class OttNode:
     def stop(self):
         if self.args.watch:
             with self.lock:
-                self.router.parar_stream(self.args.watch)
+                self.router.stop_stream(self.args.watch)
         self.node.terminar()                        # sends LEAVE, closes the socket
 
 

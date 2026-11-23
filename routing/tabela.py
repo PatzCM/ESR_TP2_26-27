@@ -1,7 +1,7 @@
 """Tabela de rotas do overlay (Modulo 2 - routing).
 
 Logica pura: nao usa sockets. O tempo e injetavel (relogio) para testes.
-IDs de nos = IP (str). IDs de stream = "<ip_servidor>/<nome>".
+IDs de nos = nome (str, ex. "Node1"). IDs de stream = "<servidor>/<video>" (ex. "Server1/video1").
 """
 import math
 import time

@@ -1,6 +1,8 @@
-"""Testes sem rede real: topologia do Cenario 2 simulada em memoria.
-Correr:  python3 -m unittest -v test_routing
+"""Testes sem rede real: topologias simuladas em memoria (Cenario 2 e Cenario final).
+Correr (dentro de routing/):  python3 -m unittest -v test_routing
 """
+import json
+import os
 import unittest
 from collections import Counter, deque
 
@@ -22,9 +24,9 @@ class Rede:
             self.recebidos[i] = []
             self.nos[i] = Router(
                 i, (lambda d, b, i=i: self._env(i, d, b)), (lambda i=i: self._viz(i)),
-                streams_servidor=(streams or {}).get(i, ()),
-                on_dados=(lambda s, p, i=i: self.recebidos[i].append(p)),
-                relogio=lambda: self.t)
+                server_streams=(streams or {}).get(i, ()),
+                on_data=(lambda s, p, i=i: self.recebidos[i].append(p)),
+                clock=lambda: self.t)
 
     def _viz(self, i):
         return [x for l in self.links for x in l if i in l and x != i]
@@ -38,7 +40,7 @@ class Rede:
     def drenar(self):
         while self.fila:
             dst, b = self.fila.popleft()
-            self.nos[dst].on_receber(b)
+            self.nos[dst].on_receive(b)
 
     def passo(self, dt=1.0, n=1):
         for _ in range(n):
@@ -47,10 +49,13 @@ class Rede:
                 r.tick()
             self.drenar()
 
+    def repor(self, a, b):
+        self.links.add(frozenset((a, b)))
+
     def falha(self, a, b):
         self.links.discard(frozenset((a, b)))
-        self.nos[a].on_vizinho_caiu(b)
-        self.nos[b].on_vizinho_caiu(a)
+        self.nos[a].on_neighbor_down(b)
+        self.nos[b].on_neighbor_down(a)
         self.drenar()
 
 
@@ -70,17 +75,17 @@ class TestRouting(unittest.TestCase):
     def test_rotas_inativas_nao_geram_trafego(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["S"].enviar_dados(S1, b"x")
+        r.nos["S"].send_data(S1, b"x")
         r.drenar()
         self.assertEqual(sum(r.dados_enviados.values()), 0)
 
     def test_replicacao_sem_duplicados(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["C1"].pedir_stream(S1)
-        r.nos["C2"].pedir_stream(S1)
+        r.nos["C1"].request_stream(S1)
+        r.nos["C2"].request_stream(S1)
         r.drenar()
-        r.nos["S"].enviar_dados(S1, b"frame1")
+        r.nos["S"].send_data(S1, b"frame1")
         r.drenar()
         self.assertEqual(r.recebidos["C1"], [b"frame1"])
         self.assertEqual(r.recebidos["C2"], [b"frame1"])
@@ -92,12 +97,12 @@ class TestRouting(unittest.TestCase):
     def test_desativar_cliente(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["C1"].pedir_stream(S1)
-        r.nos["C2"].pedir_stream(S1)
+        r.nos["C1"].request_stream(S1)
+        r.nos["C2"].request_stream(S1)
         r.drenar()
-        r.nos["C1"].parar_stream(S1)
+        r.nos["C1"].stop_stream(S1)
         r.drenar()
-        r.nos["S"].enviar_dados(S1, b"f")
+        r.nos["S"].send_data(S1, b"f")
         r.drenar()
         self.assertEqual(r.recebidos["C1"], [])
         self.assertEqual(r.recebidos["C2"], [b"f"])
@@ -106,11 +111,11 @@ class TestRouting(unittest.TestCase):
     def test_failover_rota_alternativa(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["C1"].pedir_stream(S1)
-        r.nos["C2"].pedir_stream(S1)
+        r.nos["C1"].request_stream(S1)
+        r.nos["C2"].request_stream(S1)
         r.drenar()
         r.falha("N1", "N2")                     # caminho de C1 cai
-        r.nos["S"].enviar_dados(S1, b"depois")
+        r.nos["S"].send_data(S1, b"depois")
         r.drenar()
         self.assertEqual(r.recebidos["C1"], [b"depois"])   # via N1-N3-N2
         self.assertEqual(r.recebidos["C2"], [b"depois"])
@@ -119,22 +124,123 @@ class TestRouting(unittest.TestCase):
     def test_soft_state_expira_sem_refresh(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["C1"].pedir_stream(S1)
+        r.nos["C1"].request_stream(S1)
         r.drenar()
         r.nos["C1"].tick = lambda: None         # cliente morre sem avisar
-        r.nos["C1"].on_receber = lambda b: None
+        r.nos["C1"].on_receive = lambda b: None
         r.passo(1, 12)
         self.assertFalse(r.nos["N2"].t.obter(S1).ativa)
 
     def test_ping_regista_caminho(self):
         r = cenario2()
         r.passo(1, 3)
-        r.nos["C1"].pedir_stream(S1)
+        r.nos["C1"].request_stream(S1)
         r.drenar()
         with self.assertLogs("router[C1]", level="INFO") as cm:
             r.nos["S"].ping(S1)
             r.drenar()
         self.assertIn("['S', 'N1', 'N2', 'C1']", cm.output[0])
+
+
+    def test_anuncio_nao_volta_pela_origem_nem_repete(self):
+        r = cenario2()
+        enviados = []
+        original = r._env
+        r._env = lambda s, d, b: (enviados.append((s, d, json.loads(b)["type"])), original(s, d, b))
+        for n in r.nos.values():                 # o Router guardou a lambda antiga: refazer
+            n._send = (lambda d, b, i=n.id: r._env(i, d, b))
+        r.passo(1, 1)                            # uma ronda de ANNOUNCE
+        anuncios = [(s, d) for s, d, t in enviados if t == "ANNOUNCE"]
+        self.assertNotIn(("N1", "S"), anuncios)              # nao volta pela origem
+        self.assertEqual(len(anuncios), len(set(anuncios)))  # nada enviado 2x pelo mesmo link
+
+    def test_dados_de_quem_nao_e_origem_sao_descartados(self):
+        r = cenario2()
+        r.passo(1, 3)
+        r.nos["C1"].request_stream(S1)
+        r.drenar()
+        # N3 nao e a origem de N2 para S1: um pacote vindo dai seria um ciclo
+        r.nos["N2"].on_receive(b"DATA|" + S1.encode() + b"|N3|loop")
+        r.drenar()
+        self.assertEqual(r.recebidos["C1"], [])
+        self.assertEqual(r.nos["N2"].stats["data_dropped"], 1)
+
+    def test_volta_ao_caminho_curto_quando_link_regressa(self):
+        r = cenario2()
+        r.passo(1, 3)
+        r.nos["C1"].request_stream(S1)
+        r.drenar()
+        r.falha("N1", "N2")
+        r.passo(1, 6)
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N3")
+        self.assertEqual(r.nos["C1"].t.obter(S1).metrica, 4)
+        r.repor("N1", "N2")
+        r.passo(1, 6)                            # proxima ronda de ANNOUNCE recalcula
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")
+        self.assertEqual(r.nos["C1"].t.obter(S1).metrica, 3)
+        r.nos["S"].send_data(S1, b"f")
+        r.drenar()
+        self.assertEqual(r.recebidos["C1"], [b"f"])
+        self.assertEqual(r.dados_enviados[("N3", "N2")], 0)  # N3 deixou de ser usado
+        r.passo(1, 10)                           # o destino antigo em N3 expira (soft state)
+        self.assertFalse(r.nos["N3"].t.obter(S1).ativa)
+
+
+def cenario_final():
+    """Topologia de Mixed_testing/cenarioF.json. Servidores n16 e n19 (escolha do teste),
+    cada um com 2 streams."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Mixed_testing", "cenarioF.json")
+    with open(p) as f:
+        cfg = json.load(f)
+    links = [(a, b) for a, vs in cfg["links"].items() for b in vs]
+    streams = {"n16": ["n16/video1", "n16/video2"], "n19": ["n19/video1", "n19/video2"]}
+    return Rede(links, streams=streams)
+
+
+class TestVariosServidores(unittest.TestCase):
+    def test_tabelas_distinguem_cada_fluxo(self):
+        r = cenario_final()
+        r.passo(1, 3)
+        for n in ("n5", "n10", "n23"):
+            self.assertEqual(sorted(r.nos[n].t.rotas),
+                             ["n16/video1", "n16/video2", "n19/video1", "n19/video2"])
+        self.assertEqual(r.nos["n10"].t.obter("n16/video1").metrica, 1)
+        self.assertEqual(r.nos["n1"].t.obter("n19/video2").metrica, 1)
+
+    def test_clientes_com_streams_diferentes_em_simultaneo(self):
+        r = cenario_final()
+        r.passo(1, 3)
+        pedidos = {"n17": "n16/video1", "n21": "n16/video2", "n23": "n19/video1", "n24": "n16/video1"}
+        for c, s in pedidos.items():
+            r.nos[c].request_stream(s)
+        r.drenar()
+        for s in ("n16/video1", "n16/video2", "n19/video1", "n19/video2"):
+            r.nos[s.split("/")[0]].send_data(s, s.encode())
+        r.drenar()
+        for c, s in pedidos.items():
+            self.assertEqual(r.recebidos[c], [s.encode()], c)
+        # ninguem pediu n19/video2: nao sai nenhum pacote do servidor para essa stream
+        self.assertEqual(r.recebidos["n20"], [])
+        # cada link leva no maximo 1 copia de cada stream
+        total = sum(r.dados_enviados.values())
+        self.assertLessEqual(max(r.dados_enviados.values()), 3)
+        self.assertGreater(total, 0)
+
+    def test_failover_no_cenario_final(self):
+        r = cenario_final()
+        r.passo(1, 3)
+        r.nos["n23"].request_stream("n16/video1")
+        r.drenar()
+        path = []
+        with self.assertLogs("router[n23]", level="INFO") as cm:
+            r.nos["n16"].ping("n16/video1")
+            r.drenar()
+        path = [l for l in cm.output if "PING" in l][0]
+        self.assertIn("'n10', 'n9', 'n5', 'n23'", path)      # caminho mais curto
+        r.falha("n9", "n5")
+        r.nos["n16"].send_data("n16/video1", b"depois")
+        r.drenar()
+        self.assertEqual(r.recebidos["n23"], [b"depois"])    # via n9-n6-n5
 
 
 if __name__ == "__main__":

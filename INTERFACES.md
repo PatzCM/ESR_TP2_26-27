@@ -95,6 +95,9 @@ Receive buffer: at least **2048 bytes** (recommended 65535). A video datagram is
 | `router.request_stream(stream)` | client | "I want to receive this video." |
 | `router.stop_stream(stream)` | client | "Stop sending it to me." |
 | `Router(..., on_data=fn)` → `fn(stream, payload)` | client | Called for every video packet that reaches this node. |
+| `router.dump() -> str` | any | Routing table as text (console `routes` command). |
+
+Constructor: `Router(node_id, send, neighbors, server_streams=[...], on_data=fn)`.
 
 ### One lock per node
 The `Router` is **not thread-safe**: it can't safely handle two calls at the same moment. Each node program creates **one** `threading.RLock()` and holds it around **every** call to the router: the receive thread, the `tick()` thread, and the streaming server's sending threads.
@@ -139,12 +142,12 @@ Size check: 1300 + 42 + about 32 (`DATA|…|…|`) + 28 (UDP/IP headers) ≈ 140
 | Who | Change |
 |---|---|
 | **Pedro** | Rename `id` → `from` and `porta` → `port`, `motivo` → `reason`, `vizinhos` → `neighbors`, `excluir` → `exclude`, `texto` → `text`. Value `"substituto"` → `"replacement"`. Add `from` to NEIGHBORS and ERROR. Pass `DATA|…` and the routing message types to the router instead of rejecting them. Provide `send()` and `neighbors()`, and call `on_neighbor_down()` when a neighbour goes down. Merge `cenario1.json` and `cenario2.json` into `main`. |
-| **João** | `t` → `type`, `de` → `from`, `servidor` → `server`, `metrica` → `metric`, `caminho` → `path`. Rename the shared functions as in section 3. Use names instead of IPs in the tests and the demo. Merge the `Sousa` branch into `main` (keep the scenarios in `topology/` only, drop `cenarios/` and `.DS_Store`). |
-| **Patz** | Nothing to rename. ✅ `OverlayTransport` added to `streaming/transport.py`. ✅ `ott.py` combines the three modules. Update the calls in `ott.py` and `OverlayTransport` once Pedro's and João's renames are in. |
+| **João** | ✅ Wire fields renamed (`type`, `from`, `server`, `metric`, `path`). ✅ Shared functions renamed as in section 3 (`ott.py` and `OverlayTransport` updated). ✅ Names instead of IPs in the tests and in `no_ott_router.py`. ✅ `Sousa` merged into `main`. |
+| **Patz** | Nothing to rename. ✅ `OverlayTransport` added to `streaming/transport.py`. ✅ `ott.py` combines the three modules. ✅ Router calls in `ott.py` and `OverlayTransport` updated (by João). Update the overlay calls once Pedro's renames are in. |
 
 ## 7. Running the combined node: `ott.py`
 
-`ott.py` (repo root) is the program every overlay machine runs. It implements sections 2 and 3: one receive loop that sorts datagrams, `send()`/`neighbors()` on top of Pedro's neighbour table, a `tick()` thread that also calls `on_neighbor_down()`, and the streaming server/client on top of the router. It still uses the current (pre-rename) names in Pedro's and João's code.
+`ott.py` (repo root) is the program every overlay machine runs. It implements sections 2 and 3: one receive loop that sorts datagrams, `send()`/`neighbors()` on top of Pedro's neighbour table, a `tick()` thread that also calls `on_neighbor_down()`, and the streaming server/client on top of the router. It uses the English router names; Pedro's overlay code still has its pre-rename names.
 
 ```bash
 # Cenário 1 in CORE (names and IPs from Mixed_testing/cenario1.json)
