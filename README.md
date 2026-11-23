@@ -109,7 +109,7 @@ Exemplo com o Cenário 2: `Server – Node1 – {Node2, Node3}`, `Node2 – Node
 
 Tabela de rotas do Node1 com os dois clientes ativos (comando `routes`):
 ```
-{Fluxo: Server/video1, Origem: Server, Metrica: 1.0, Destinos: ['Node2', 'Node3'], Estado: ativa}
+{Fluxo: Server/video1, Origem: Server, Metrica: 1.05, Destinos: ['Node2', 'Node3'], Estado: ativa}
 ```
 
 ### 3. Ativação e entrega do vídeo
