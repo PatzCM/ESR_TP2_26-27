@@ -162,7 +162,7 @@ class TestRouting(unittest.TestCase):
         original = r._env
         r._env = lambda s, d, b: (enviados.append((s, d, json.loads(b)["type"])), original(s, d, b))
         for n in r.nos.values():                 # o Router guardou a lambda antiga: refazer
-            n._send = (lambda d, b, i=n.id: r._env(i, d, b))
+            n._enviar = (lambda d, b, i=n.id: r._env(i, d, b))
         r.passo(1, 1)                            # uma ronda de ANNOUNCE
         anuncios = [(s, d) for s, d, t in enviados if t == "ANNOUNCE"]
         self.assertNotIn(("N1", "S"), anuncios)              # nao volta pela origem
@@ -177,7 +177,7 @@ class TestRouting(unittest.TestCase):
         r.nos["N2"].on_receive(b"DATA|" + S1.encode() + b"|N3|loop")
         r.drenar()
         self.assertEqual(r.recebidos["C1"], [])
-        self.assertEqual(r.nos["N2"].stats["data_dropped"], 1)
+        self.assertEqual(r.nos["N2"].estatisticas["dados_descartados"], 1)
 
     def test_volta_ao_caminho_curto_quando_link_regressa(self):
         r = cenario2()
@@ -273,8 +273,8 @@ class TestMetricaAtraso(unittest.TestCase):
         r.atraso[frozenset(("N1", "N2"))] = 0.040           # 40 ms
         r.correr(4)
         # o simulador entrega em passos de 5 ms, por isso a medida sai por excesso
-        self.assertAlmostEqual(r.nos["N2"].link_delay("N1"), 40, delta=6)
-        self.assertAlmostEqual(r.nos["N2"].link_delay("N3"), 0, delta=2)
+        self.assertAlmostEqual(r.nos["N2"].atraso_ligacao("N1"), 40, delta=6)
+        self.assertAlmostEqual(r.nos["N2"].atraso_ligacao("N3"), 0, delta=2)
         self.assertIn("N1=", r.nos["N2"].dump())
 
     def test_evita_ligacao_lenta(self):

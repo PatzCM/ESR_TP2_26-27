@@ -32,7 +32,7 @@ Para não oscilar com o ruído das medições há **histerese**: um nó só troc
 
 **Replicação: árvore por stream.** Um pacote é enviado uma vez por destino ativo, por isso num tronco comum segue uma única cópia e só se divide onde os caminhos se separam. Rotas inativas não geram tráfego.
 
-**Anti-ciclos.** Um pacote `DATA` só é aceite se vier da origem atual da rota; o resto é descartado e contado em `stats["data_dropped"]`.
+**Anti-ciclos.** Um pacote `DATA` só é aceite se vier da origem atual da rota; o resto é descartado e contado em `estatisticas["dados_descartados"]`.
 
 **Atualização dinâmica.** Quando o overlay avisa que um vizinho caiu, as suas entradas saem da tabela, a origem é recalculada e o ACTIVATE segue pelo novo caminho (DEACTIVATE para o antigo). Uma rota que deixa de receber ANNOUNCE expira em 15 s. Quando um caminho melhor volta a existir, ou uma ligação fica mais lenta ou mais rápida, a ronda seguinte de ANNOUNCE escolhe o novo caminho.
 

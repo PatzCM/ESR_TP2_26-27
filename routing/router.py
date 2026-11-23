@@ -1,22 +1,25 @@
-"""Overlay router (Module 2 - João): announces, activation, replication, failover.
+"""Router do overlay (Modulo 2 - Joao): anuncios, ativacao, replicacao, failover.
 
-Needs two functions from the overlay module (Pedro), see INTERFACES.md section 3:
-    send(to: str, data: bytes) -> None     # send to the neighbour with ID `to`
-    neighbors() -> list[str]               # IDs of the neighbours that are alive
-and the overlay calls these on the Router:
-    on_receive(data: bytes)                # every routing/data datagram received
-    on_neighbor_down(id: str)
-    tick()                                 # about once per second
+Precisa de duas funcoes do modulo overlay (Pedro), ver INTERFACES.md seccao 3:
+    send(to: str, data: bytes) -> None     # envia ao vizinho com ID `to`
+    neighbors() -> list[str]               # IDs dos vizinhos que estao vivos
+e o overlay chama estas funcoes no Router:
+    on_receive(data: bytes)                # cada datagrama de routing/dados recebido
+    on_neighbor_down(id: str)              # um vizinho caiu ou saiu
+    tick()                                 # cerca de uma vez por segundo
 
-Control messages: one JSON object, always with "type" and "from" (sender ID).
+Os nomes das funcoes publicas e dos campos das mensagens ficam em ingles
+(decisao do grupo, INTERFACES.md seccao 1). O resto do modulo esta em portugues.
 
-Metric (metric="delay", the default): cost of a link = measured one-way delay
-in ms (half the smoothed RTT of PROBE/PROBE_REPLY) + HOP_PENALTY_MS per hop.
-With no delay on the links this is the hop count; with delay, delay dominates.
-metric="hops" uses the plain hop count.
-Data: b"DATA|<stream>|<from>|<payload>"  (payload is opaque, never re-encoded).
+Mensagens de controlo: um objeto JSON, sempre com "type" e "from" (ID do emissor).
+Dados: b"DATA|<stream>|<from>|<payload>"  (payload opaco, nunca e recodificado).
 
-The Router is NOT thread-safe: hold the node's single lock around every call.
+Metrica (metric="delay", por omissao): custo de uma ligacao = atraso num sentido
+medido em ms (metade do RTT suavizado de PROBE/PROBE_REPLY) + PENALIZACAO_SALTO_MS.
+Sem atraso nas ligacoes da o numero de saltos; com atraso, e o atraso que decide.
+metric="hops" usa apenas o numero de saltos.
+
+O Router NAO e thread-safe: segurar o lock unico do no a volta de todas as chamadas.
 """
 import json
 import logging
@@ -24,12 +27,13 @@ import time
 
 from tabela import LOCAL, TabelaRotas
 
+# tipos de mensagem que o no deve entregar ao router (usado pelo ott.py)
 ROUTING_TYPES = {"ANNOUNCE", "ACTIVATE", "DEACTIVATE", "PING", "PROBE", "PROBE_REPLY"}
 
-HOP_PENALTY_MS = 1.0     # added per hop, so a shorter path wins when delays are equal
-DEFAULT_LINK_MS = 0.0    # delay assumed for a link not measured yet
-RTT_ALPHA = 0.3          # EWMA weight of a new RTT sample
-HYSTERESIS = 0.1         # delay mode: switch origin only if >10% better
+PENALIZACAO_SALTO_MS = 1.0   # somado por salto: com atrasos iguais ganha o caminho mais curto
+ATRASO_DESCONHECIDO_MS = 0.0 # atraso assumido para uma ligacao ainda nao medida
+ALFA_RTT = 0.3               # peso de uma nova amostra de RTT na media movel (EWMA)
+HISTERESE = 0.1              # modo atraso: so troca de origem se for >10% melhor
 
 
 class Router:
@@ -37,172 +41,172 @@ class Router:
                  clock=time.monotonic, announce_period=5.0, refresh_period=2.0,
                  metric="delay", probe_period=1.0):
         if metric not in ("delay", "hops"):
-            raise ValueError("metric must be 'delay' or 'hops'")
+            raise ValueError("metric tem de ser 'delay' ou 'hops'")
         self.id = node_id
-        self._send = send
-        self._neighbors = neighbors
-        self.on_data = on_data                # fn(stream, payload) -> this node's client
-        self.now = clock
-        self.announce_period = announce_period
-        self.refresh_period = refresh_period
-        # route expires after 3 missed ANNOUNCEs (15 s), destination after 3 missed ACTIVATEs (6 s)
+        self._enviar = send
+        self._vizinhos = neighbors
+        self.on_data = on_data                # fn(stream, payload) -> cliente deste no
+        self.agora = clock
+        self.periodo_anuncio = announce_period
+        self.periodo_refresh = refresh_period
+        self.periodo_probe = probe_period
         self.metric = metric
-        self.probe_period = probe_period
+        # rota expira apos 3 ANNOUNCE falhados (15 s), destino apos 3 ACTIVATE falhados (6 s)
         self.t = TabelaRotas(3 * announce_period, 3 * refresh_period, clock,
-                             histerese=HYSTERESIS if metric == "delay" else 0.0)
-        self.srtt = {}                        # neighbour -> smoothed RTT (ms)
-        self._last_probe = float("-inf")
+                             histerese=HISTERESE if metric == "delay" else 0.0)
+        self.srtt = {}                        # vizinho -> RTT suavizado (ms)
         self.log = logging.getLogger(f"router[{node_id}]")
-        self.server_streams = list(server_streams)
-        for s in self.server_streams:
+        self.streams_servidor = list(server_streams)
+        for s in self.streams_servidor:
             self.t.criar_local(s, node_id)
-        self._seq = int(time.time())          # does not restart at 0 if the server restarts
-        self._last_announce = float("-inf")
-        self._last_refresh = float("-inf")
-        self.stats = {"data_in": 0, "data_out": 0, "data_dropped": 0}
+        self._seq = int(time.time())          # nao recomeca em 0 se o servidor reiniciar
+        self._ult_anuncio = float("-inf")
+        self._ult_refresh = float("-inf")
+        self._ult_probe = float("-inf")
+        self.estatisticas = {"dados_recebidos": 0, "dados_enviados": 0, "dados_descartados": 0}
 
-    # ---------- API for the streaming module (Patz) ----------
+    # ---------- API para o modulo de streaming (Patz) ----------
     def request_stream(self, stream):
-        """Client: "I want to receive this stream"."""
+        """Cliente: "quero receber esta stream"."""
         self.t.ativar(stream, LOCAL)
-        self._reconcile(stream)
+        self._reconciliar(stream)
 
     def stop_stream(self, stream):
-        """Client: "stop sending it to me"."""
+        """Cliente: "deixa de ma enviar"."""
         self.t.desativar(stream, LOCAL)
-        self._reconcile(stream)
+        self._reconciliar(stream)
 
     def send_data(self, stream, payload):
-        """Server: inject one video packet into the overlay."""
-        self._replicate(stream, None, payload)
+        """Servidor: injeta um pacote de video no overlay."""
+        self._replicar(stream, None, payload)
 
     def ping(self, stream):
-        """Server: path test along the active routes (Etapa 3)."""
-        self._propagate_ping(stream, None, [])
+        """Servidor: teste de percurso pelas rotas ativas (Etapa 3)."""
+        self._propagar_ping(stream, None, [])
 
     def dump(self):
-        """Human-readable routing table (for the node console)."""
-        out = self.t.dump()
+        """Tabela de rotas em texto (consola do no, comando `routes`)."""
+        texto = self.t.dump()
         if self.metric == "delay" and self.srtt:
-            links = ", ".join(f"{n}={self.link_delay(n):.2f}ms" for n in sorted(self.srtt))
-            out = (out + "\n" if out else "") + f"link delay (RTT/2): {links}"
-        return out
+            ligacoes = ", ".join(f"{v}={self.atraso_ligacao(v):.2f}ms" for v in sorted(self.srtt))
+            texto = (texto + "\n" if texto else "") + f"atraso das ligacoes (RTT/2): {ligacoes}"
+        return texto
 
-    def link_delay(self, neighbor):
-        """Estimated one-way delay to a neighbour, in ms."""
-        rtt = self.srtt.get(neighbor)
-        return DEFAULT_LINK_MS if rtt is None else rtt / 2
+    # ---------- metrica ----------
+    def atraso_ligacao(self, vizinho):
+        """Atraso num sentido estimado ate um vizinho, em ms."""
+        rtt = self.srtt.get(vizinho)
+        return ATRASO_DESCONHECIDO_MS if rtt is None else rtt / 2
 
-    def link_cost(self, neighbor):
+    def custo_ligacao(self, vizinho):
         if self.metric == "hops":
             return 1
-        return HOP_PENALTY_MS + self.link_delay(neighbor)
+        return PENALIZACAO_SALTO_MS + self.atraso_ligacao(vizinho)
 
-    # ---------- events from the overlay (Pedro) ----------
+    # ---------- eventos vindos do overlay (Pedro) ----------
     def on_receive(self, data):
         if data.startswith(b"DATA|"):
-            parts = data.split(b"|", 3)
-            if len(parts) == 4:
-                self.stats["data_in"] += 1
-                self._replicate(parts[1].decode(), parts[2].decode(), parts[3])
+            partes = data.split(b"|", 3)
+            if len(partes) == 4:
+                self.estatisticas["dados_recebidos"] += 1
+                self._replicar(partes[1].decode(), partes[2].decode(), partes[3])
             return
         try:
             m = json.loads(data)
-            kind, sender = m["type"], m["from"]
-            if kind == "PROBE":
-                self._ctrl(sender, "PROBE_REPLY", t=m["t"])
+            tipo, emissor = m["type"], m["from"]
+            if tipo == "PROBE":
+                self._ctrl(emissor, "PROBE_REPLY", t=m["t"])
                 return
-            if kind == "PROBE_REPLY":
-                self._on_probe_reply(sender, float(m["t"]))
+            if tipo == "PROBE_REPLY":
+                self._on_probe_reply(emissor, float(m["t"]))
                 return
             stream = m["stream"]
         except (ValueError, KeyError, TypeError):
-            return  # UDP: garbage is ignored
+            return  # UDP: lixo e ignorado
         try:
-            if kind == "ANNOUNCE":
-                self._on_announce(sender, m)
-            elif kind == "ACTIVATE":
-                if self.t.ativar(stream, sender):
-                    self.log.info("%s: %s activated it", stream, sender)
-                self._reconcile(stream)
-            elif kind == "DEACTIVATE":
-                self.t.desativar(stream, sender)
-                self.log.info("%s: %s deactivated it", stream, sender)
-                self._reconcile(stream)
-            elif kind == "PING":
-                self._propagate_ping(stream, sender, list(m.get("path", [])))
+            if tipo == "ANNOUNCE":
+                self._on_announce(emissor, m)
+            elif tipo == "ACTIVATE":
+                if self.t.ativar(stream, emissor):
+                    self.log.info("%s: %s ativou-a", stream, emissor)
+                self._reconciliar(stream)
+            elif tipo == "DEACTIVATE":
+                self.t.desativar(stream, emissor)
+                self.log.info("%s: %s desativou-a", stream, emissor)
+                self._reconciliar(stream)
+            elif tipo == "PING":
+                self._propagar_ping(stream, emissor, list(m.get("path", [])))
         except (KeyError, TypeError, ValueError) as e:
-            self.log.warning("bad %s from %s: %r", kind, sender, e)
+            self.log.warning("%s invalido de %s: %r", tipo, emissor, e)
 
     def on_neighbor_down(self, node_id):
-        self.log.info("neighbour %s is down", node_id)
+        self.log.info("vizinho %s em baixo", node_id)
         self.srtt.pop(node_id, None)
         for s in self.t.remover_vizinho(node_id):
-            self._reconcile(s)
+            self._reconciliar(s)
 
     def tick(self):
-        now = self.now()
-        if self.metric == "delay" and now - self._last_probe >= self.probe_period:
-            self._last_probe = now
-            for n in self._neighbors():           # our own clock is echoed back: no sync needed
-                self._ctrl(n, "PROBE", t=round(now * 1000, 3))
-        if self.server_streams and now - self._last_announce >= self.announce_period:
-            self._last_announce = now
+        agora = self.agora()
+        if self.metric == "delay" and agora - self._ult_probe >= self.periodo_probe:
+            self._ult_probe = agora
+            for v in self._vizinhos():            # o nosso relogio volta no PROBE_REPLY: sem sincronizacao
+                self._ctrl(v, "PROBE", t=round(agora * 1000, 3))
+        if self.streams_servidor and agora - self._ult_anuncio >= self.periodo_anuncio:
+            self._ult_anuncio = agora
             self._seq += 1
-            for s in self.server_streams:
-                self._flood({"type": "ANNOUNCE", "from": self.id, "stream": s,
-                             "server": self.id, "metric": 0, "seq": self._seq})
-        if now - self._last_refresh >= self.refresh_period:
-            self._last_refresh = now
-            for r in self.t.rotas.values():       # soft state: refresh the upstream activation
+            for s in self.streams_servidor:
+                self._inundar({"type": "ANNOUNCE", "from": self.id, "stream": s,
+                               "server": self.id, "metric": 0, "seq": self._seq})
+        if agora - self._ult_refresh >= self.periodo_refresh:
+            self._ult_refresh = agora
+            for r in self.t.rotas.values():       # soft state: renova a ativacao a montante
                 if r.ativa and r.upstream:
                     self._ctrl(r.upstream, "ACTIVATE", stream=r.stream)
         for s in self.t.expirar():
-            self._reconcile(s)
+            self._reconciliar(s)
 
-    # ---------- internals ----------
+    # ---------- internos ----------
     @staticmethod
-    def _encode(msg):
+    def _codificar(msg):
         return json.dumps(msg, separators=(",", ":")).encode()
 
-    def _ctrl(self, to, kind, **fields):
-        self._send(to, self._encode({"type": kind, "from": self.id, **fields}))
+    def _ctrl(self, destino, tipo, **campos):
+        self._enviar(destino, self._codificar({"type": tipo, "from": self.id, **campos}))
 
-    def _flood(self, msg, except_=None):
-        data = self._encode(msg)
-        for n in self._neighbors():
-            if n != except_:                      # never back through the link it came from
-                self._send(n, data)
+    def _inundar(self, msg, excepto=None):
+        dados = self._codificar(msg)
+        for v in self._vizinhos():
+            if v != excepto:                      # nunca de volta pela ligacao de onde veio
+                self._enviar(v, dados)
 
-    def _on_probe_reply(self, sender, sent_ms):
-        sample = self.now() * 1000 - sent_ms
-        if sample < -1:                           # not a timestamp of ours: ignore
+    def _on_probe_reply(self, emissor, enviado_ms):
+        amostra = self.agora() * 1000 - enviado_ms
+        if amostra < -1:                          # nao e um carimbo nosso: ignorar
             return
-        sample = max(sample, 0.0)                 # rounding of the timestamp can give -0.0
-        old = self.srtt.get(sender)
-        self.srtt[sender] = sample if old is None else (1 - RTT_ALPHA) * old + RTT_ALPHA * sample
+        amostra = max(amostra, 0.0)               # o arredondamento do carimbo pode dar -0.0
+        antigo = self.srtt.get(emissor)
+        self.srtt[emissor] = amostra if antigo is None else (1 - ALFA_RTT) * antigo + ALFA_RTT * amostra
 
-    def _on_announce(self, sender, m):
-        before = self.t.obter(m["stream"])
-        old_origin = before.origem if before else None
-        forward, cost = self.t.anuncio(m["stream"], m["server"], sender,
-                                       int(m["metric"]) if self.metric == "hops" else float(m["metric"]),
-                                       int(m["seq"]),
-                                       custo_link=self.link_cost(sender))
-        if cost is not None:
-            cost = int(cost) if self.metric == "hops" else round(cost, 3)
-        if forward:
-            self._flood({"type": "ANNOUNCE", "from": self.id, "stream": m["stream"],
-                         "server": m["server"], "metric": cost, "seq": m["seq"]},
-                        except_=sender)
-        new_origin = self.t.obter(m["stream"]).origem
-        if new_origin != old_origin:
-            self.log.info("%s: best route now via %s (metric %s %s)", m["stream"], new_origin,
-                          cost, "hops" if self.metric == "hops" else "ms")
-        self._reconcile(m["stream"])
+    def _on_announce(self, emissor, m):
+        antes = self.t.obter(m["stream"])
+        origem_antiga = antes.origem if antes else None
+        metrica = int(m["metric"]) if self.metric == "hops" else float(m["metric"])
+        reenviar, custo = self.t.anuncio(m["stream"], m["server"], emissor, metrica,
+                                         int(m["seq"]), custo_link=self.custo_ligacao(emissor))
+        if custo is not None:
+            custo = int(custo) if self.metric == "hops" else round(custo, 3)
+        if reenviar:
+            self._inundar({"type": "ANNOUNCE", "from": self.id, "stream": m["stream"],
+                           "server": m["server"], "metric": custo, "seq": m["seq"]},
+                          excepto=emissor)
+        origem_nova = self.t.obter(m["stream"]).origem
+        if origem_nova != origem_antiga:
+            self.log.info("%s: melhor rota agora via %s (metrica %s %s)", m["stream"], origem_nova,
+                          custo, "saltos" if self.metric == "hops" else "ms")
+        self._reconciliar(m["stream"])
 
-    def _reconcile(self, stream):
-        """Make the upstream activation match the current best origin."""
+    def _reconciliar(self, stream):
+        """Garante que a ativacao a montante corresponde a melhor origem atual."""
         r = self.t.obter(stream)
         if not r or r.local:
             return
@@ -211,32 +215,32 @@ class Router:
                 if r.upstream:
                     self._ctrl(r.upstream, "DEACTIVATE", stream=stream)
                 self._ctrl(r.origem, "ACTIVATE", stream=stream)
-                self.log.info("%s activated via %s", stream, r.origem)
+                self.log.info("%s ativada via %s", stream, r.origem)
                 r.upstream = r.origem
         elif r.upstream:
             self._ctrl(r.upstream, "DEACTIVATE", stream=stream)
             r.upstream = None
 
-    def _replicate(self, stream, sender, payload):
-        dests = self.t.destinos_dados(stream, sender)
-        if not dests:
-            if sender is not None:
-                self.stats["data_dropped"] += 1   # inactive route or not from our origin
+    def _replicar(self, stream, emissor, payload):
+        destinos = self.t.destinos_dados(stream, emissor)
+        if not destinos:
+            if emissor is not None:
+                self.estatisticas["dados_descartados"] += 1   # rota inativa ou nao veio da origem
             return
-        packet = b"DATA|" + stream.encode() + b"|" + self.id.encode() + b"|" + payload
-        for d in dests:
+        pacote = b"DATA|" + stream.encode() + b"|" + self.id.encode() + b"|" + payload
+        for d in destinos:
             if d == LOCAL:
                 if self.on_data:
                     self.on_data(stream, payload)
             else:
-                self._send(d, packet)
-                self.stats["data_out"] += 1
-        self.log.debug("DATA %s from %s -> %s", stream, sender or "(local server)", dests)
+                self._enviar(d, pacote)
+                self.estatisticas["dados_enviados"] += 1
+        self.log.debug("DATA %s de %s -> %s", stream, emissor or "(servidor local)", destinos)
 
-    def _propagate_ping(self, stream, sender, path):
-        path = path + [self.id]
-        dests = self.t.destinos_dados(stream, sender)
-        self.log.info("PING %s path=%s -> %s", stream, path, dests)
-        for d in dests:
+    def _propagar_ping(self, stream, emissor, caminho):
+        caminho = caminho + [self.id]
+        destinos = self.t.destinos_dados(stream, emissor)
+        self.log.info("PING %s caminho=%s -> %s", stream, caminho, destinos)
+        for d in destinos:
             if d != LOCAL:
-                self._ctrl(d, "PING", stream=stream, path=path)
+                self._ctrl(d, "PING", stream=stream, path=caminho)

@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Routing demo: minimal UDP node (manual neighbours) + João's Router.
+"""Demo de routing: no UDP minimo (vizinhos manuais) + Router do Joao.
 
-Tests the routing module alone, without Pedro's bootstrapper or Patz's video:
-the server sends one text "frame" per second. For the full node use ott.py.
+Testa o modulo de routing sozinho, sem o bootstrapper do Pedro nem o video do
+Patz: o servidor envia um "frame" de texto por segundo. Para o no completo usar ott.py.
 
-Usage: python3 no_ott_router.py --id NAME [--port 5000] [--neighbors ID=IP:PORT ...]
-                                [--serve VIDEO] [--watch SERVER/VIDEO] [--ping]
-  --serve VIDEO        this node serves stream "<id>/VIDEO" (repeatable)
-  --watch STREAM       this node wants to receive STREAM (repeatable)
-  --ping               (server) sends a PING every 5 s
-  --bind IP            default 0.0.0.0 (only change for local tests)
-  --metric delay|hops  routing metric (default: measured delay + 1 ms per hop)
+Uso: python3 no_ott_router.py --id NOME [--port 5000] [--neighbors ID=IP:PORTA ...]
+                              [--serve VIDEO] [--watch SERVIDOR/VIDEO] [--ping]
+  --serve VIDEO        este no serve a stream "<id>/VIDEO" (pode repetir-se)
+  --watch STREAM       este no quer receber STREAM (pode repetir-se)
+  --ping               (servidor) envia um PING de 5 em 5 s
+  --bind IP            por omissao 0.0.0.0 (so mudar em testes locais)
+  --metric delay|hops  metrica de routing (por omissao: atraso medido + 1 ms por salto)
 
-Console:
-  routes        show this node's routing table
-  ping          server: send a PING along the active routes
-  down <id>     simulate a neighbour going down
-  quit
+Consola (mesmos comandos do ott.py):
+  routes        mostra a tabela de rotas deste no
+  ping          servidor: envia um PING pelas rotas ativas
+  down <id>     simula a queda de um vizinho
+  quit          sair
 
-Example (Cenario 1 in CORE; the router "Node" also runs the program):
+Exemplo (Cenario 1 no CORE; o router "Node" tambem corre o programa):
   Server : python3 no_ott_router.py --id Server  --neighbors Node=10.0.0.1:5000 --serve video1
   Node   : python3 no_ott_router.py --id Node    --neighbors Server=10.0.0.20:5000 \\
                                      Client1=10.0.1.20:5000 Client2=10.0.2.20:5000
@@ -39,7 +39,7 @@ from router import Router  # noqa: E402
 ap = argparse.ArgumentParser(usage=__doc__)
 ap.add_argument("--id", required=True)
 ap.add_argument("--port", type=int, default=5000)
-ap.add_argument("--neighbors", nargs="*", default=[], metavar="ID=IP:PORT")
+ap.add_argument("--neighbors", nargs="*", default=[], metavar="ID=IP:PORTA")
 ap.add_argument("--serve", action="append", default=[], metavar="VIDEO")
 ap.add_argument("--watch", action="append", default=[], metavar="STREAM")
 ap.add_argument("--ping", action="store_true")
@@ -50,96 +50,96 @@ args = ap.parse_args()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s",
                     datefmt="%H:%M:%S")
 
-ADDRESS = {}                          # neighbour ID -> (ip, port): the "address book"
+ENDERECOS = {}                        # ID do vizinho -> (ip, porta): o "livro de enderecos"
 for item in args.neighbors:
-    nid, addr = item.split("=", 1)
-    ip, port = addr.rsplit(":", 1)
-    ADDRESS[nid] = (ip, int(port))
+    nid, endereco = item.split("=", 1)
+    ip, porta = endereco.rsplit(":", 1)
+    ENDERECOS[nid] = (ip, int(porta))
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((args.bind, args.port))
-lock = threading.RLock()              # the Router is not thread-safe
-running = True
+lock = threading.RLock()              # o Router nao e thread-safe
+a_correr = True
 
 
-def send(to, data):
-    if to not in ADDRESS:
+def enviar(destino, dados):
+    if destino not in ENDERECOS:
         return
     try:
-        sock.sendto(data, ADDRESS[to])
+        sock.sendto(dados, ENDERECOS[destino])
     except OSError as e:
-        logging.warning("send to %s failed: %s", to, e)
+        logging.warning("falha a enviar para %s: %s", destino, e)
 
 
-def on_data(stream, payload):
-    print(f"\n[CLIENT {args.id}] {stream} <- {payload!r}", flush=True)
+def ao_receber_dados(stream, payload):
+    print(f"\n[CLIENTE {args.id}] {stream} <- {payload!r}", flush=True)
 
 
 STREAMS = [f"{args.id}/{v}" for v in args.serve]
-router = Router(args.id, send, lambda: list(ADDRESS),
-                server_streams=STREAMS, on_data=on_data, metric=args.metric)
+router = Router(args.id, enviar, lambda: list(ENDERECOS),
+                server_streams=STREAMS, on_data=ao_receber_dados, metric=args.metric)
 
 
-def receive():
-    while running:
+def receber():
+    while a_correr:
         try:
-            data, _ = sock.recvfrom(65535)
+            dados, _ = sock.recvfrom(65535)
         except OSError:
             break
         with lock:
-            router.on_receive(data)
+            router.on_receive(dados)
 
 
-def timers():
-    """Router timers, one text frame per second (server) and PINGs."""
-    next_frame = next_ping = 0.0
+def temporizadores():
+    """Timers do Router, um frame de texto por segundo (servidor) e PINGs."""
+    prox_frame = prox_ping = 0.0
     n = 0
-    while running:
+    while a_correr:
         with lock:
             router.tick()
-            now = time.monotonic()
-            if STREAMS and now >= next_frame:
-                next_frame, n = now + 1.0, n + 1
+            agora = time.monotonic()
+            if STREAMS and agora >= prox_frame:
+                prox_frame, n = agora + 1.0, n + 1
                 for s in STREAMS:
                     router.send_data(s, f"frame {n}".encode())
-            if args.ping and STREAMS and now >= next_ping:
-                next_ping = now + 5
+            if args.ping and STREAMS and agora >= prox_ping:
+                prox_ping = agora + 5
                 for s in STREAMS:
                     router.ping(s)
         time.sleep(0.2)
 
 
 def main():
-    global running
-    threading.Thread(target=receive, daemon=True).start()
-    threading.Thread(target=timers, daemon=True).start()
+    global a_correr
+    threading.Thread(target=receber, daemon=True).start()
+    threading.Thread(target=temporizadores, daemon=True).start()
     with lock:
         for s in args.watch:
             router.request_stream(s)
-    print(f"[{args.id}] port {args.port} neighbours={ADDRESS} serve={STREAMS} watch={args.watch}")
+    print(f"[{args.id}] porta {args.port} vizinhos={ENDERECOS} serve={STREAMS} watch={args.watch}")
     try:
         while True:
-            line = input("> ").strip()
-            if line == "quit":
+            linha = input("> ").strip()
+            if linha == "quit":
                 break
-            elif line == "ping":
+            elif linha == "ping":
                 with lock:
                     for s in STREAMS:
                         router.ping(s)
-            elif line == "routes":
+            elif linha == "routes":
                 with lock:
-                    print(router.dump() or "(empty)")
-            elif line.startswith("down "):
-                nid = line.split()[1]
-                if ADDRESS.pop(nid, None):
+                    print(router.dump() or "(vazia)")
+            elif linha.startswith("down "):
+                nid = linha.split()[1]
+                if ENDERECOS.pop(nid, None):
                     with lock:
                         router.on_neighbor_down(nid)
-            elif line:
-                print("commands: routes | ping | down <id> | quit")
+            elif linha:
+                print("comandos: routes | ping | down <id> | quit")
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
-        running = False
+        a_correr = False
         sock.close()
 
 
