@@ -45,19 +45,20 @@ One JSON object per UDP datagram. **Every message has `type` and `from`.**
 
 | type | Direction | Fields |
 |---|---|---|
-| `ANNOUNCE` | server → flood | `type, from, stream, server, metric, seq` |
+| `ANNOUNCE` | server → flood | `type, from, stream, server, delay, hops, path, seq` |
 | `ACTIVATE` | client → towards server | `type, from, stream` |
 | `DEACTIVATE` | client → towards server | `type, from, stream` |
 | `PING` | server → along active routes | `type, from, stream, path` (list of node IDs it went through) |
 | `PROBE` | node → each neighbour | `type, from, t` (sender's own clock, ms) |
 | `PROBE_REPLY` | neighbour → node | `type, from, t` (the same `t`, echoed back) |
 
-- `metric` is the route cost. Default (`--metric delay`): sum over the links of (one-way delay in ms + 1 ms per hop). The delay of a link is half the smoothed RTT of `PROBE`/`PROBE_REPLY`. With `--metric hops` it is the hop count (an integer).
+- Route metric (agreed with the teacher): **1st criterion `delay`** (ms from the server, lower is better), **2nd criterion `hops`** (tie-break only). If both are equal, either route is fine (the current one is kept). Two delays count as equal when they differ by at most 2 ms or 10%. The delay of a link is half the smoothed RTT of `PROBE`/`PROBE_REPLY`.
+- `path` is the list of node IDs the ANNOUNCE went through, starting at the server. A node ignores an ANNOUNCE whose `path` already contains it (that route would be a loop).
 
 Examples:
 ```json
 {"type": "REGISTER", "from": "Node1", "port": 5000}
-{"type": "ANNOUNCE", "from": "Node1", "stream": "Server1/video1", "server": "Server1", "metric": 2.31, "seq": 17}
+{"type": "ANNOUNCE", "from": "Node1", "stream": "Server1/video1", "server": "Server1", "delay": 2.31, "hops": 1, "path": ["Server1", "Node1"], "seq": 17}
 {"type": "ACTIVATE", "from": "Client1", "stream": "Server1/video1"}
 ```
 
@@ -102,7 +103,7 @@ Receive buffer: at least **2048 bytes** (recommended 65535). A video datagram is
 | `Router(..., on_data=fn)` → `fn(stream, payload)` | client | Called for every video packet that reaches this node. |
 | `router.dump() -> str` | any | Routing table as text (console `routes` command). |
 
-Constructor: `Router(node_id, send, neighbors, server_streams=[...], on_data=fn, metric="delay")`.
+Constructor: `Router(node_id, send, neighbors, server_streams=[...], on_data=fn)`.
 
 ### One lock per node
 The `Router` is **not thread-safe**: it can't safely handle two calls at the same moment. Each node program creates **one** `threading.RLock()` and holds it around **every** call to the router: the receive thread, the `tick()` thread, and the streaming server's sending threads.
@@ -148,7 +149,7 @@ Size check: 1300 + 42 + about 32 (`DATA|…|…|`) + 28 (UDP/IP headers) ≈ 140
 | Who | Change |
 |---|---|
 | **Pedro** | Rename `id` → `from` and `porta` → `port`, `motivo` → `reason`, `vizinhos` → `neighbors`, `excluir` → `exclude`, `texto` → `text`. Value `"substituto"` → `"replacement"`. Add `from` to NEIGHBORS and ERROR. Pass `DATA|…` and the routing message types to the router instead of rejecting them. Provide `send()` and `neighbors()`, and call `on_neighbor_down()` when a neighbour goes down. Merge `cenario1.json` and `cenario2.json` into `main`. |
-| **João** | ✅ Wire fields renamed (`type`, `from`, `server`, `metric`, `path`). ✅ Shared functions renamed as in section 3 (`ott.py` and `OverlayTransport` updated). ✅ Names instead of IPs in the tests and in `no_ott_router.py`. ✅ `Sousa` merged into `main`. |
+| **João** | ✅ Wire fields renamed (`type`, `from`, `server`, `path`). ✅ Metric: delay first, hops as tie-break (`delay`, `hops`, `path` in ANNOUNCE). ✅ Shared functions renamed as in section 3 (`ott.py` and `OverlayTransport` updated). ✅ Names instead of IPs in the tests and in `no_ott_router.py`. ✅ `Sousa` merged into `main`. |
 | **Patz** | Nothing to rename. ✅ `OverlayTransport` added to `streaming/transport.py`. ✅ `ott.py` combines the three modules. ✅ Router calls in `ott.py` and `OverlayTransport` updated (by João). Update the overlay calls once Pedro's renames are in. |
 
 ## 7. Running the combined node: `ott.py`

@@ -33,7 +33,7 @@ O contrato entre os módulos (mensagens, funções, temporizadores) está em **[
 ├── routing/                   Módulo 2 — Routing (João)
 │   ├── tabela.py              tabela de rotas (lógica pura, sem rede)
 │   ├── router.py              ANNOUNCE/ACTIVATE/DEACTIVATE/PING/PROBE, replicação
-│   ├── test_routing.py        19 testes com rede simulada (atraso por ligação)
+│   ├── test_routing.py        27 testes com rede simulada (atraso por ligação, sem ciclos)
 │   └── README.md              decisões técnicas e limitações do routing
 │
 ├── streaming/                 Módulo 3 — Streaming (Patz)
@@ -102,14 +102,14 @@ Estratégia mista: bootstrapper com recurso aos vizinhos manuais.
 Exemplo com o Cenário 2: `Server – Node1 – {Node2, Node3}`, `Node2 – Node3`, `Node2 – Client1`, `Node3 – Client2`.
 
 1. **Medição das ligações.** De 1 em 1 s cada nó envia `PROBE` a cada vizinho e mede o RTT pelo `PROBE_REPLY`. O atraso de uma ligação é RTT/2, suavizado por uma média móvel exponencial.
-2. **Anúncio.** De 5 em 5 s o servidor envia `ANNOUNCE` (stream, servidor, `metric = 0`, `seq` novo) a todos os vizinhos.
-3. **Inundação controlada.** Cada nó soma o custo da ligação por onde o anúncio chegou (atraso + 1 ms) e guarda o vizinho como candidato. Só reenvia o anúncio se for a primeira cópia desse `seq` ou se trouxer um custo melhor, e nunca o devolve a quem lho enviou.
-4. **Escolha da origem.** A origem da rota é o candidato de menor custo. Só muda se o novo for mais de 10% melhor (histerese contra oscilações).
+2. **Anúncio.** De 5 em 5 s o servidor envia `ANNOUNCE` (stream, servidor, `delay = 0`, `hops = 0`, `path = [servidor]`, `seq` novo) a todos os vizinhos.
+3. **Inundação controlada.** Cada nó soma a `delay` o atraso medido da ligação por onde o anúncio chegou, soma 1 a `hops`, junta-se a `path` e guarda o vizinho como candidato. Só reenvia o anúncio se for a primeira cópia desse `seq` ou se trouxer uma métrica melhor. Nunca o devolve a quem lho enviou e ignora anúncios que já passaram por ele (evita ciclos).
+4. **Escolha da origem** (métrica definida com o docente): **1.º menor atraso; 2.º, entre atrasos iguais, menos saltos; se ambos forem iguais, fica a atual.** Atrasos a menos de 2 ms ou 10% um do outro contam como iguais, para não trocar de rota por ruído. Só contam candidatos da ronda atual (como no DSDV).
 5. **Rotas inativas.** Até haver clientes, as rotas existem mas estão inativas e não há tráfego de dados.
 
 Tabela de rotas do Node1 com os dois clientes ativos (comando `routes`):
 ```
-{Fluxo: Server/video1, Origem: Server, Metrica: 1.05, Destinos: ['Node2', 'Node3'], Estado: ativa}
+{Fluxo: Server/video1, Origem: Server, Atraso: 0.00 ms, Saltos: 1, Destinos: ['Node2', 'Node3'], Estado: ativa}
 ```
 
 ### 3. Ativação e entrega do vídeo
@@ -126,7 +126,7 @@ Tabela de rotas do Node1 com os dois clientes ativos (comando `routes`):
 | Acontecimento | Reação |
 |---|---|
 | Um vizinho cai ou sai | O overlay deteta-o (6 s sem HELLO, ou LEAVE) → `on_neighbor_down` → o router remove-o da tabela, escolhe outra origem e envia `ACTIVATE` pelo novo caminho e `DEACTIVATE` pelo antigo |
-| Uma ligação fica mais lenta | O PROBE mede o novo atraso → no ANNOUNCE seguinte o custo sobe → a rota muda se houver uma alternativa mais de 10% melhor |
+| Uma ligação fica mais lenta | O PROBE mede o novo atraso → no ANNOUNCE seguinte o atraso dessa rota sobe → a rota muda para a alternativa mais rápida, mesmo com mais saltos |
 | Um caminho melhor volta a existir | No ANNOUNCE seguinte é escolhido de novo |
 | Um servidor deixa de anunciar | A rota expira ao fim de 15 s |
 | Um cliente desaparece | O destino expira ao fim de 6 s; os ramos sem clientes desligam-se |
@@ -157,7 +157,7 @@ python3 ott.py --id Client1 --bootstrapper 10.0.0.20:5000 --watch Server/video1
 python3 ott.py --id Client2 --bootstrapper 10.0.0.20:5000 --watch Server/video1 --no-gui
 ```
 
-Opções úteis: `--serve NOME=FICHEIRO` (pode repetir-se), `--watch SERVIDOR/NOME`, `--metric delay|hops`, `--neighbors ID=IP:PORTA` (recurso), `--no-gui`, `--fps`, `--buffer`. Ver `python3 ott.py --help`.
+Opções úteis: `--serve NOME=FICHEIRO` (pode repetir-se), `--watch SERVIDOR/NOME`, `--neighbors ID=IP:PORTA` (recurso), `--no-gui`, `--fps`, `--buffer`. Ver `python3 ott.py --help`.
 
 Consola dos nós sem vídeo: `neighbors` (vizinhos), `routes` (tabela de rotas e atraso medido de cada ligação), `ping` (no servidor) e `quit`.
 
@@ -178,7 +178,7 @@ Para testar a métrica: no CORE, duplo clique num link → *delay* (ex. 50 ms) e
 | 7 | Rede monitorizada; rotas atualizadas com entrada/saída de nós e mudanças nas condições da rede | Routing + Overlay | ✅ PROBE + ANNOUNCE periódico; ⚠️ recuperação lenta (~5 s) |
 | 8 | Os nós reenviam todos os dados de acordo com a tabela | Routing | ✅ replicação por destino ativo, anti-ciclos |
 | 9 | Pelo menos 2 servidores, cada um com pelo menos 2 streams | Streaming + Integração | ⚠️ suportado (`--serve` repetido), falta configurar e testar no CORE |
-| 10 | Métricas da rede na construção das rotas | Routing | ✅ atraso medido + 1 ms por salto |
+| 10 | Métricas da rede na construção das rotas | Routing | ✅ 1.º atraso medido, 2.º saltos (desempate), como definido com o docente |
 | — | Etapa 3: PING que regista o caminho | Routing | ✅ |
 | — | Etapa 4: servidor lê o vídeo e envia pacotes numerados; cliente reproduz numa janela | Streaming | ✅ |
 | — | Cenários de teste 1, 2 e 3 | Todos | ⚠️ XML e JSON prontos, faltam os testes no CORE |
@@ -201,14 +201,14 @@ Para testar a métrica: no CORE, duplo clique num link → *delay* (ex. 50 ms) e
 
 ### Módulo 2 — Routing (João)
 
-Os requisitos 5, 6, 8 e 10 e a Etapa 3 estão implementados e têm 19 testes automáticos. Falta:
+Os requisitos 5, 6, 8 e 10 e a Etapa 3 estão implementados e têm 27 testes automáticos. Falta:
 
 - 🔴 **Provar no CORE (requisitos 6, 7 e 10)** e guardar os resultados para o relatório:
   1. a tabela de rotas (`routes`) em cada nó, nos 3 cenários;
   2. a saída do PING com o caminho, comparada com o melhor caminho esperado;
   3. a replicação: no Cenário 2, com 2 clientes, só uma cópia na ligação comum (ver os logs ou capturar com `tcpdump`);
   4. uma falha: matar um nó intermédio e medir quanto tempo o cliente fica sem vídeo;
-  5. a métrica: pôr 50 ms de atraso num link do CORE e mostrar a rota a mudar; comparar com `--metric hops`.
+  5. a métrica: sem atraso, mostrar que ganha o caminho com menos saltos; com 50 ms num link desse caminho, mostrar a rota a passar para o caminho mais longo mas mais rápido.
 - 🟡 **Perdas na métrica.** Hoje só se mede o atraso. Contar os PROBE sem resposta e penalizar o custo (ex. atraso × (1 + 10 × taxa de perda)) faz a rota evitar também ligações com perdas.
 - 🟡 **Reação mais rápida a mudanças de atraso.** Um caminho melhor só é adotado no ANNOUNCE seguinte (até 5 s), e a média móvel demora cerca de 10 s a acompanhar uma descida grande. Pode baixar-se o período de ANNOUNCE para 2–3 s ou subir `ALFA_RTT`, à custa de mais tráfego ou de mais oscilação.
 - 🟢 Listar no cliente as streams conhecidas (as que estão na tabela de rotas), para o utilizador escolher sem saber os nomes.

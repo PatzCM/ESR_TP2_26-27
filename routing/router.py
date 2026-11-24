@@ -14,10 +14,11 @@ Os nomes das funcoes publicas e dos campos das mensagens ficam em ingles
 Mensagens de controlo: um objeto JSON, sempre com "type" e "from" (ID do emissor).
 Dados: b"DATA|<stream>|<from>|<payload>"  (payload opaco, nunca e recodificado).
 
-Metrica (metric="delay", por omissao): custo de uma ligacao = atraso num sentido
-medido em ms (metade do RTT suavizado de PROBE/PROBE_REPLY) + PENALIZACAO_SALTO_MS.
-Sem atraso nas ligacoes da o numero de saltos; com atraso, e o atraso que decide.
-metric="hops" usa apenas o numero de saltos.
+Metrica (definida com o docente): 1.o criterio o atraso (menor e melhor),
+2.o criterio o numero de saltos, so para desempatar; se ambos forem iguais
+qualquer um serve. O atraso de uma ligacao e medido por PROBE/PROBE_REPLY
+(metade do RTT suavizado). Cada ANNOUNCE leva o atraso e os saltos acumulados
+desde o servidor. A comparacao esta em tabela.py (melhor_que / _escolher).
 
 O Router NAO e thread-safe: segurar o lock unico do no a volta de todas as chamadas.
 """
@@ -30,18 +31,14 @@ from tabela import LOCAL, TabelaRotas
 # tipos de mensagem que o no deve entregar ao router (usado pelo ott.py)
 ROUTING_TYPES = {"ANNOUNCE", "ACTIVATE", "DEACTIVATE", "PING", "PROBE", "PROBE_REPLY"}
 
-PENALIZACAO_SALTO_MS = 1.0   # somado por salto: com atrasos iguais ganha o caminho mais curto
 ATRASO_DESCONHECIDO_MS = 0.0 # atraso assumido para uma ligacao ainda nao medida
 ALFA_RTT = 0.3               # peso de uma nova amostra de RTT na media movel (EWMA)
-HISTERESE = 0.1              # modo atraso: so troca de origem se for >10% melhor
 
 
 class Router:
     def __init__(self, node_id, send, neighbors, server_streams=(), on_data=None,
                  clock=time.monotonic, announce_period=5.0, refresh_period=2.0,
-                 metric="delay", probe_period=1.0):
-        if metric not in ("delay", "hops"):
-            raise ValueError("metric tem de ser 'delay' ou 'hops'")
+                 probe_period=1.0):
         self.id = node_id
         self._enviar = send
         self._vizinhos = neighbors
@@ -50,10 +47,8 @@ class Router:
         self.periodo_anuncio = announce_period
         self.periodo_refresh = refresh_period
         self.periodo_probe = probe_period
-        self.metric = metric
         # rota expira apos 3 ANNOUNCE falhados (15 s), destino apos 3 ACTIVATE falhados (6 s)
-        self.t = TabelaRotas(3 * announce_period, 3 * refresh_period, clock,
-                             histerese=HISTERESE if metric == "delay" else 0.0)
+        self.t = TabelaRotas(3 * announce_period, 3 * refresh_period, clock)
         self.srtt = {}                        # vizinho -> RTT suavizado (ms)
         self.log = logging.getLogger(f"router[{node_id}]")
         self.streams_servidor = list(server_streams)
@@ -87,7 +82,7 @@ class Router:
     def dump(self):
         """Tabela de rotas em texto (consola do no, comando `routes`)."""
         texto = self.t.dump()
-        if self.metric == "delay" and self.srtt:
+        if self.srtt:
             ligacoes = ", ".join(f"{v}={self.atraso_ligacao(v):.2f}ms" for v in sorted(self.srtt))
             texto = (texto + "\n" if texto else "") + f"atraso das ligacoes (RTT/2): {ligacoes}"
         return texto
@@ -97,11 +92,6 @@ class Router:
         """Atraso num sentido estimado ate um vizinho, em ms."""
         rtt = self.srtt.get(vizinho)
         return ATRASO_DESCONHECIDO_MS if rtt is None else rtt / 2
-
-    def custo_ligacao(self, vizinho):
-        if self.metric == "hops":
-            return 1
-        return PENALIZACAO_SALTO_MS + self.atraso_ligacao(vizinho)
 
     # ---------- eventos vindos do overlay (Pedro) ----------
     def on_receive(self, data):
@@ -147,7 +137,7 @@ class Router:
 
     def tick(self):
         agora = self.agora()
-        if self.metric == "delay" and agora - self._ult_probe >= self.periodo_probe:
+        if agora - self._ult_probe >= self.periodo_probe:
             self._ult_probe = agora
             for v in self._vizinhos():            # o nosso relogio volta no PROBE_REPLY: sem sincronizacao
                 self._ctrl(v, "PROBE", t=round(agora * 1000, 3))
@@ -156,7 +146,8 @@ class Router:
             self._seq += 1
             for s in self.streams_servidor:
                 self._inundar({"type": "ANNOUNCE", "from": self.id, "stream": s,
-                               "server": self.id, "metric": 0, "seq": self._seq})
+                               "server": self.id, "delay": 0, "hops": 0,
+                               "path": [self.id], "seq": self._seq})
         if agora - self._ult_refresh >= self.periodo_refresh:
             self._ult_refresh = agora
             for r in self.t.rotas.values():       # soft state: renova a ativacao a montante
@@ -190,19 +181,23 @@ class Router:
     def _on_announce(self, emissor, m):
         antes = self.t.obter(m["stream"])
         origem_antiga = antes.origem if antes else None
-        metrica = int(m["metric"]) if self.metric == "hops" else float(m["metric"])
-        reenviar, custo = self.t.anuncio(m["stream"], m["server"], emissor, metrica,
-                                         int(m["seq"]), custo_link=self.custo_ligacao(emissor))
-        if custo is not None:
-            custo = int(custo) if self.metric == "hops" else round(custo, 3)
+        caminho = list(m.get("path", []))
+        reenviar, metrica = self.t.anuncio(m["stream"], m["server"], emissor,
+                                           float(m["delay"]), int(m["hops"]), int(m["seq"]),
+                                           atraso_ligacao=self.atraso_ligacao(emissor),
+                                           caminho=caminho, eu=self.id)
         if reenviar:
             self._inundar({"type": "ANNOUNCE", "from": self.id, "stream": m["stream"],
-                           "server": m["server"], "metric": custo, "seq": m["seq"]},
+                           "server": m["server"], "delay": round(metrica[0], 3),
+                           "hops": metrica[1], "path": caminho + [self.id], "seq": m["seq"]},
                           excepto=emissor)
-        origem_nova = self.t.obter(m["stream"]).origem
-        if origem_nova != origem_antiga:
-            self.log.info("%s: melhor rota agora via %s (metrica %s %s)", m["stream"], origem_nova,
-                          custo, "saltos" if self.metric == "hops" else "ms")
+        rota = self.t.obter(m["stream"])
+        if rota.origem != origem_antiga:
+            if rota.origem is None:
+                self.log.info("%s: sem rota", m["stream"])
+            else:
+                self.log.info("%s: melhor rota agora via %s (atraso %.2f ms, %d saltos)",
+                              m["stream"], rota.origem, rota.atraso, rota.saltos)
         self._reconciliar(m["stream"])
 
     def _reconciliar(self, stream):

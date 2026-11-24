@@ -28,9 +28,9 @@ Exemplo com o Cenário 2: `Server – Node1 – Node2 – Client1`, `Node1 – N
 | # | O que acontece | Mensagem | Código |
 |---|---|---|---|
 | 1 | De 1 em 1 s cada nó mede o atraso até cada vizinho | `PROBE` → `PROBE_REPLY` | `tick()`, `_on_probe_reply()` |
-| 2 | De 5 em 5 s o servidor anuncia as suas streams | `ANNOUNCE` (metric 0, seq novo) | `tick()` |
-| 3 | Cada nó soma o custo da ligação (atraso + 1 ms), guarda quem lho enviou como candidato e reenvia aos outros vizinhos (só a 1.ª cópia ou uma melhor, nunca para trás) | `ANNOUNCE` | `_on_announce()` → `tabela.anuncio()` |
-| 4 | A origem da rota passa a ser o candidato mais barato. A rota existe, mas está **inativa**: não passa vídeo | — | `tabela._escolher()` |
+| 2 | De 5 em 5 s o servidor anuncia as suas streams | `ANNOUNCE` (delay 0, hops 0, path [servidor], seq novo) | `tick()` |
+| 3 | Cada nó soma o atraso medido da ligação a `delay` e 1 a `hops`, junta-se a `path`, guarda quem lho enviou como candidato e reenvia aos outros vizinhos (só a 1.ª cópia ou uma melhor, nunca para trás; ignora anúncios que já passaram por ele) | `ANNOUNCE` | `_on_announce()` → `tabela.anuncio()` |
+| 4 | A origem da rota passa a ser o candidato com **menor atraso**; com atrasos iguais, o de **menos saltos**. A rota existe, mas está **inativa**: não passa vídeo | — | `tabela._escolher()` |
 | 5 | O Client1 quer ver: envia ACTIVATE à sua origem (Node2), que o reenvia à dele (Node1), e assim até ao servidor | `ACTIVATE` | `request_stream()`, `_reconciliar()` |
 | 6 | Cada nó pelo caminho regista quem pediu em **destinos**: a rota fica **ativa** | — | `tabela.ativar()` |
 | 7 | O servidor envia vídeo; cada nó manda uma cópia a cada destino. No Node1 a stream divide-se em duas (Node2 e Node3); na ligação Server–Node1 vai uma só cópia | `DATA\|stream\|from\|…` | `send_data()`, `_replicar()` |
@@ -45,23 +45,24 @@ Exemplo com o Cenário 2: `Server – Node1 – Node2 – Client1`, `Node1 – N
 | Acontecimento | O que o router faz |
 |---|---|
 | O Node2 cai | O overlay chama `on_neighbor_down("Node2")`. O router apaga-o da tabela, escolhe outra origem (Node3) e envia `ACTIVATE` por lá. O vídeo volta pelo novo caminho. |
-| Um link fica lento | O PROBE mede o novo atraso. No ANNOUNCE seguinte o custo sobe e a rota muda, se a alternativa for mais de 10% melhor (histerese contra oscilações). |
+| Um link fica lento | O PROBE mede o novo atraso. No ANNOUNCE seguinte o atraso dessa rota sobe e ela muda para a alternativa mais rápida, mesmo que tenha mais saltos. Diferenças até 2 ms ou 10% contam como empate, para não trocar por ruído. |
 | O link volta ao normal | O ANNOUNCE seguinte volta a escolher o caminho bom e o ramo antigo expira. |
 | O servidor desaparece | Sem ANNOUNCE durante 15 s, a rota expira. |
 
 ## A tabela de rotas (o que o enunciado pede)
 
-O comando `routes` na consola do `ott.py` mostra, por exemplo no Node1:
+O comando `routes` na consola do `ott.py` mostra, por exemplo no Node2 com 50 ms de atraso no link Node1–Node2:
 ```
-{Fluxo: Server/video1, Origem: Server, Metrica: 1.05, Destinos: ['Node2', 'Node3'], Estado: ativa}
-atraso das ligacoes (RTT/2): Node2=0.05ms, Node3=0.04ms, Server=0.05ms
+{Fluxo: Server/video1, Origem: Node3, Atraso: 0.00 ms, Saltos: 3, Destinos: ['Client1'], Estado: ativa}
+atraso das ligacoes (RTT/2): Client1=0.00ms, Node1=50.81ms, Node3=0.00ms
 ```
+O Node2 recebe pelo Node3 (3 saltos, 0 ms) em vez de diretamente pelo Node1 (2 saltos, 50 ms): o atraso vem primeiro.
 
 | Campo do enunciado | No código (`tabela.py`, classe `Rota`) |
 |---|---|
 | Fluxo | `stream` (`"Servidor/video"`) |
 | Origem | `origem`: o vizinho de onde chega o vídeo |
-| Custo / Métrica | `metrica`: custo pela origem |
+| Métrica | `atraso` (1.º critério) e `saltos` (desempate) pela origem |
 | Destinos | `destinos`: os vizinhos (ou `LOCAL`, o cliente deste nó) que pediram |
 | Estado | `estado`: ativa se houver destinos |
 | (extra) | `candidatos`: todos os vizinhos que anunciaram, com o custo de cada um, o que dá rotas alternativas imediatas |
@@ -72,7 +73,7 @@ atraso das ligacoes (RTT/2): Node2=0.05ms, Node3=0.04ms, Server=0.05ms
 |---|---|
 | `routing/tabela.py` | A tabela: guardar candidatos, escolher a origem, ativar, desativar, expirar. Sem rede, por isso é fácil de testar. |
 | `routing/router.py` | As mensagens (ANNOUNCE, ACTIVATE, DEACTIVATE, PING, PROBE) e o reenvio dos pacotes de vídeo. |
-| `routing/test_routing.py` | 19 testes com a rede simulada em memória (Cenário 2 e cenário final, atraso por link). |
+| `routing/test_routing.py` | 27 testes com a rede simulada em memória (Cenário 2 e cenário final, atraso por link, critérios da métrica, ausência de ciclos). |
 | `routing/README.md` | Decisões técnicas e limitações, para o relatório. |
 | `no_ott_router.py` | Demo só do routing, sem bootstrapper nem vídeo real. |
 
@@ -87,5 +88,5 @@ No CORE: `routes` em cada nó, `ping` no servidor, e um link com atraso (duplo c
 ## O que ainda depende de ti
 
 1. Fazer as provas no CORE (tabelas, PING, falha, atraso) e guardar prints e números para o relatório.
-2. Comparar `--metric delay` com `--metric hops` num cenário com um link lento: é uma boa secção de "testes e resultados".
+2. Mostrar os dois critérios no CORE: sem atraso nos links ganha o caminho com menos saltos; com 50 ms num link do caminho curto, a rota passa para o caminho mais longo mas mais rápido. É uma boa secção de "testes e resultados".
 3. Combinar com o Pedro uma deteção de falhas mais rápida: hoje são 6 s sem HELLO, e é isso que faz o vídeo congelar cerca de 5 s.

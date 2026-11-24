@@ -9,12 +9,13 @@ import unittest
 from collections import Counter
 
 from router import Router
+from tabela import PIOR, TabelaRotas, melhor_que
 
 S1 = "S/v1"
 
 
 class Rede:
-    def __init__(self, links, servidores=None, streams=None, metric="delay"):
+    def __init__(self, links, servidores=None, streams=None):
         self.t = 0.0
         self.links = {frozenset(l) for l in links}
         self.atraso = {}                       # frozenset(link) -> atraso num sentido (s)
@@ -30,7 +31,7 @@ class Rede:
                 i, (lambda d, b, i=i: self._env(i, d, b)), (lambda i=i: self._viz(i)),
                 server_streams=(streams or {}).get(i, ()),
                 on_data=(lambda s, p, i=i: self.recebidos[i].append(p)),
-                clock=lambda: self.t, metric=metric)
+                clock=lambda: self.t)
 
     def _viz(self, i):
         return [x for l in self.links for x in l if i in l and x != i]
@@ -80,10 +81,10 @@ def cenario2():
 
 
 class TestRouting(unittest.TestCase):
-    def test_metricas_por_saltos(self):
+    def test_saltos_contados_em_cada_no(self):
         r = cenario2()
         r.passo(1, 3)
-        m = {n: r.nos[n].t.obter(S1).metrica for n in ("N1", "N2", "N3", "C1", "C2")}
+        m = {n: r.nos[n].t.obter(S1).saltos for n in ("N1", "N2", "N3", "C1", "C2")}
         self.assertEqual(m, {"N1": 1, "N2": 2, "N3": 2, "C1": 3, "C2": 3})
 
     def test_rotas_inativas_nao_geram_trafego(self):
@@ -187,11 +188,11 @@ class TestRouting(unittest.TestCase):
         r.falha("N1", "N2")
         r.passo(1, 6)
         self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N3")
-        self.assertEqual(r.nos["C1"].t.obter(S1).metrica, 4)
+        self.assertEqual(r.nos["C1"].t.obter(S1).saltos, 4)
         r.repor("N1", "N2")
         r.passo(1, 6)                            # proxima ronda de ANNOUNCE recalcula
         self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")
-        self.assertEqual(r.nos["C1"].t.obter(S1).metrica, 3)
+        self.assertEqual(r.nos["C1"].t.obter(S1).saltos, 3)
         r.nos["S"].send_data(S1, b"f")
         r.drenar()
         self.assertEqual(r.recebidos["C1"], [b"f"])
@@ -219,8 +220,8 @@ class TestVariosServidores(unittest.TestCase):
         for n in ("n5", "n10", "n23"):
             self.assertEqual(sorted(r.nos[n].t.rotas),
                              ["n16/video1", "n16/video2", "n20/video1", "n20/video2"])
-        self.assertEqual(r.nos["n10"].t.obter("n16/video1").metrica, 1)
-        self.assertEqual(r.nos["n1"].t.obter("n20/video2").metrica, 1)
+        self.assertEqual(r.nos["n10"].t.obter("n16/video1").saltos, 1)
+        self.assertEqual(r.nos["n1"].t.obter("n20/video2").saltos, 1)
 
     def test_clientes_com_streams_diferentes_em_simultaneo(self):
         r = cenario_final()
@@ -260,13 +261,55 @@ class TestVariosServidores(unittest.TestCase):
 
 
 
-class TestMetricaAtraso(unittest.TestCase):
-    """Etapa 2 / requisito "metricas da rede": custo = atraso medido + 1 ms por salto."""
+class TestCriterios(unittest.TestCase):
+    """Metrica definida com o docente: 1.o atraso (menor e melhor), 2.o saltos
+    (desempate); se ambos forem iguais qualquer um serve."""
 
-    def test_sem_atraso_equivale_a_saltos(self):
+    def escolher(self, candidatos, atual=None):
+        t = TabelaRotas(relogio=lambda: 0.0)
+        r = t._get(S1)
+        r.candidatos = {v: (m, 0.0) for v, m in candidatos.items()}
+        r.origem = atual
+        t._escolher(r)
+        return r.origem
+
+    def test_menor_atraso_ganha_mesmo_com_mais_saltos(self):
+        self.assertEqual(self.escolher({"A": (10.0, 4), "B": (50.0, 1)}), "A")
+
+    def test_atrasos_iguais_desempata_por_saltos(self):
+        # 10,0 e 10,5 ms contam como iguais (diferenca < 2 ms): ganha o de menos saltos
+        self.assertEqual(self.escolher({"A": (10.5, 2), "B": (10.0, 3)}), "A")
+
+    def test_ambos_iguais_fica_o_atual(self):
+        self.assertEqual(self.escolher({"A": (10.0, 2), "B": (10.0, 2)}, atual="B"), "B")
+        self.assertEqual(self.escolher({"A": (10.0, 2), "B": (10.0, 2)}, atual="A"), "A")
+
+    def test_ruido_na_medicao_nao_troca_de_rota(self):
+        # o novo parece 0,5 ms mais rapido, com os mesmos saltos: e ruido, nao troca
+        self.assertEqual(self.escolher({"A": (10.0, 2), "B": (9.5, 2)}, atual="A"), "A")
+
+    def test_atraso_claramente_menor_troca_de_rota(self):
+        self.assertEqual(self.escolher({"A": (60.0, 2), "B": (10.0, 3)}, atual="A"), "B")
+
+    def test_menos_saltos_com_atraso_igual_troca_de_rota(self):
+        self.assertEqual(self.escolher({"A": (10.0, 4), "B": (10.2, 2)}, atual="A"), "B")
+
+    def test_melhor_que(self):
+        self.assertTrue(melhor_que((5.0, 9), (50.0, 1)))     # atraso decide
+        self.assertTrue(melhor_que((5.0, 1), (5.5, 2)))      # atraso igual: saltos
+        self.assertFalse(melhor_que((5.0, 2), (5.0, 2)))     # igual: nao e melhor
+        self.assertTrue(melhor_que((100.0, 9), PIOR))
+
+
+class TestMetricaAtraso(unittest.TestCase):
+    """O atraso e medido na rede (PROBE) e acumulado ao longo do caminho."""
+
+    def test_sem_atraso_nas_ligacoes_decidem_os_saltos(self):
         r = cenario2()
         r.correr(3)
-        self.assertAlmostEqual(r.nos["C1"].t.obter(S1).metrica, 3, places=1)
+        rota = r.nos["C1"].t.obter(S1)
+        self.assertEqual(rota.saltos, 3)
+        self.assertLess(rota.atraso, 1.0)
 
     def test_mede_atraso_de_cada_ligacao(self):
         r = cenario2()
@@ -277,11 +320,21 @@ class TestMetricaAtraso(unittest.TestCase):
         self.assertAlmostEqual(r.nos["N2"].atraso_ligacao("N3"), 0, delta=2)
         self.assertIn("N1=", r.nos["N2"].dump())
 
-    def test_evita_ligacao_lenta(self):
+    def test_atraso_acumulado_ao_longo_do_caminho(self):
+        r = cenario2()
+        r.atraso[frozenset(("S", "N1"))] = 0.020            # 20 ms logo no 1.o link
+        r.correr(12)
+        self.assertAlmostEqual(r.nos["C1"].t.obter(S1).atraso, 20, delta=6)
+        self.assertEqual(r.nos["C1"].t.obter(S1).saltos, 3)    # sem ciclos
+        self.assertIn("Atraso:", r.nos["C1"].dump())
+
+    def test_evita_ligacao_lenta_mesmo_com_mais_saltos(self):
         r = cenario2()
         r.atraso[frozenset(("N1", "N2"))] = 0.050           # caminho curto mas lento
         r.correr(12)                                         # medir + 2 rondas de ANNOUNCE
-        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N3")   # S-N1-N3-N2-C1
+        rota = r.nos["N2"].t.obter(S1)
+        self.assertEqual(rota.origem, "N3")                  # S-N1-N3-N2: 3 saltos, ~0 ms
+        self.assertEqual(rota.saltos, 3)
         r.nos["C1"].request_stream(S1)
         r.correr(0.5)
         r.nos["S"].send_data(S1, b"f")
@@ -300,23 +353,52 @@ class TestMetricaAtraso(unittest.TestCase):
         self.assertEqual(r.nos["N2"].t.obter(S1).upstream, "N3")  # ACTIVATE seguiu o novo caminho
         del r.atraso[frozenset(("N1", "N2"))]                # volta ao normal
         r.correr(20)
-        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")
+        self.assertEqual(r.nos["N2"].t.obter(S1).origem, "N1")    # atraso igual: menos saltos
 
-    def test_histerese_ignora_diferencas_pequenas(self):
-        r = cenario2()
-        r.correr(8)
-        rota = r.nos["N2"].t.obter(S1)
-        self.assertEqual(rota.origem, "N1")
-        # N3 passa a parecer 0,1 ms melhor (ruido): nao deve trocar
-        rota.candidatos["N3"] = (rota.metrica - 0.1, r.t)
-        r.nos["N2"].t._escolher(rota)
-        self.assertEqual(rota.origem, "N1")
 
-    def test_modo_saltos_continua_disponivel(self):
-        r = Rede([("S", "N1"), ("N1", "C")], streams={"S": [S1]}, metric="hops")
-        r.passo(1, 3)
-        self.assertEqual(r.nos["C"].t.obter(S1).metrica, 2)
-        self.assertIsInstance(r.nos["C"].t.obter(S1).metrica, int)
+class TestSemCiclos(unittest.TestCase):
+    def test_anuncio_que_ja_passou_por_mim_e_ignorado(self):
+        t = TabelaRotas(relogio=lambda: 0.0)
+        t.anuncio(S1, "S", "A", 5.0, 1, seq=1, caminho=["S", "A"], eu="X")
+        reenviar, _ = t.anuncio(S1, "S", "B", 0.0, 1, seq=1, caminho=["S", "X", "B"], eu="X")
+        self.assertFalse(reenviar)
+        self.assertNotIn("B", t.obter(S1).candidatos)
+        self.assertEqual(t.obter(S1).origem, "A")
+
+    def seguir_origens(self, r, no, servidor, limite=30):
+        caminho = [no]
+        while caminho[-1] != servidor:
+            rota = r.nos[caminho[-1]].t.obter(f"{servidor}/video1")
+            if rota is None or rota.origem is None:
+                return None
+            caminho.append(rota.origem)
+            if len(caminho) > limite or len(set(caminho)) != len(caminho):
+                self.fail(f"ciclo: {caminho}")
+        return caminho
+
+    def test_atrasos_aleatorios_e_falhas_nunca_criam_ciclos(self):
+        import random
+        for semente in range(5):
+            rnd = random.Random(semente)
+            r = cenario_final()
+            for l in r.links:
+                r.atraso[l] = rnd.choice([0.0, 0.0, 0.005, 0.020, 0.050])
+            r.correr(12, dt=0.01)
+            for _ in range(3):                           # 3 mudancas seguidas
+                l = rnd.choice(sorted(r.links, key=sorted))
+                r.atraso[l] = rnd.choice([0.0, 0.030, 0.080])
+                if rnd.random() < 0.3:
+                    r.links.discard(l)
+                    for a, b in [tuple(l), tuple(l)[::-1]]:
+                        r.nos[a].on_neighbor_down(b)
+                r.correr(8, dt=0.01)
+                # no 1.o segundo de cada ronda pode haver um ciclo passageiro (GRACA_RONDA);
+                # os dados nao circulam porque so se aceitam da origem. Verificar depois.
+                while not 2.0 <= r.t % 5 <= 4.0:
+                    r.correr(0.1, dt=0.01)
+                for no in ("n17", "n18", "n19", "n22", "n23"):
+                    for servidor in ("n16", "n20"):
+                        self.seguir_origens(r, no, servidor)
 
 
 if __name__ == "__main__":

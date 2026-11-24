@@ -10,7 +10,6 @@ Uso: python3 no_ott_router.py --id NOME [--port 5000] [--neighbors ID=IP:PORTA .
   --watch STREAM       este no quer receber STREAM (pode repetir-se)
   --ping               (servidor) envia um PING de 5 em 5 s
   --bind IP            por omissao 0.0.0.0 (so mudar em testes locais)
-  --metric delay|hops  metrica de routing (por omissao: atraso medido + 1 ms por salto)
 
 Consola (mesmos comandos do ott.py):
   routes        mostra a tabela de rotas deste no
@@ -44,7 +43,6 @@ ap.add_argument("--serve", action="append", default=[], metavar="VIDEO")
 ap.add_argument("--watch", action="append", default=[], metavar="STREAM")
 ap.add_argument("--ping", action="store_true")
 ap.add_argument("--bind", default="0.0.0.0")
-ap.add_argument("--metric", choices=("delay", "hops"), default="delay")
 args = ap.parse_args()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s",
@@ -77,7 +75,7 @@ def ao_receber_dados(stream, payload):
 
 STREAMS = [f"{args.id}/{v}" for v in args.serve]
 router = Router(args.id, enviar, lambda: list(ENDERECOS),
-                server_streams=STREAMS, on_data=ao_receber_dados, metric=args.metric)
+                server_streams=STREAMS, on_data=ao_receber_dados)
 
 
 def receber():

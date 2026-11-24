@@ -57,7 +57,7 @@ class OttNode:
 
         self.router = Router(args.id, self.send, self.neighbors,
                              server_streams=list(self.served),
-                             on_data=self.on_data, metric=args.metric)
+                             on_data=self.on_data)
 
     # ---- what the overlay gives the router (INTERFACES.md section 3)
     def send(self, to, data):
@@ -192,8 +192,6 @@ def main():
                     help="offer a video as stream <id>/<NAME> (repeatable)")
     ap.add_argument("--watch", metavar="STREAM", help="play this stream, e.g. Server/video1")
     ap.add_argument("--no-gui", action="store_true", help="client: print frames instead of a window")
-    ap.add_argument("--metric", choices=("delay", "hops"), default="delay",
-                    help="routing metric: measured link delay + 1 ms/hop (default) or hop count")
     ap.add_argument("--fps", type=float, default=20, help="frames per second (default 20)")
     ap.add_argument("--buffer", type=int, default=5, help="client: frames to buffer before playing")
     args = ap.parse_args()
