@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
 """Nó overlay OTT (Etapa 1) - estratégia mista: bootstrapper + vizinhos manuais. UDP.
 
+Versão adaptada ao contrato do INTERFACES.md: campos das mensagens em inglês,
+funções públicas para o router (João) e para o streaming (Patz).
+
 MODOS DE ARRANQUE
   Nó que é o bootstrapper (ex: o servidor), lê a topologia de um ficheiro:
-      python3 no_ott.py --id Server --config cenario1.json
+      python3 no_ott_mixed.py --id Server --config cenario1.json
 
   Nó normal, só precisa de conhecer o bootstrapper:
-      python3 no_ott.py --id Node --bootstrapper 10.0.0.20:5000
+      python3 no_ott_mixed.py --id Node --bootstrapper 10.0.0.20:5000
 
   Nó normal com fallback manual (usado se o bootstrapper não responder):
-      python3 no_ott.py --id Node --bootstrapper 10.0.0.20:5000 \
-                        --vizinhos Client1=10.0.1.20:5000 Client2=10.0.2.20:5000
+      python3 no_ott_mixed.py --id Node --bootstrapper 10.0.0.20:5000 \
+                              --neighbors Client1=10.0.1.20:5000 Client2=10.0.2.20:5000
 
   Modo totalmente manual (sem bootstrapper):
-      python3 no_ott.py --id Node --vizinhos Server=10.0.0.20:5000 Client1=10.0.1.20:5000
+      python3 no_ott_mixed.py --id Node --neighbors Server=10.0.0.20:5000
 
-MENSAGENS (JSON sobre UDP; o campo "type" identifica a mensagem)
-  REGISTER      nó -> bootstrapper   {"type","id","porta"}      (também serve de "estou vivo")
-  NEIGHBORS     bootstrapper -> nó   {"type","motivo","vizinhos":[{"id","ip","port"}],"min_degree"}
-  NEED_NEIGHBOR nó -> bootstrapper   {"type","id","excluir":[ids]}  (pedir substituto)
-  ERROR         bootstrapper -> nó   {"type","motivo"}
-  HELLO         nó <-> vizinho       {"type","id","porta"}      (keep-alive)
-  LEAVE         nó -> todos          {"type","id"}
-  MSG           nó -> vizinhos       {"type","id","texto"}     (apenas para testes)
+MENSAGENS DO OVERLAY (JSON sobre UDP; todas têm "type" e "from")
+  REGISTER      nó -> bootstrapper   {"type","from","port"}      (também serve de "estou vivo")
+  NEIGHBORS     bootstrapper -> nó   {"type","from","reason","neighbors":[{"id","ip","port"}],"min_degree"}
+                                     reason = "register" | "replacement"
+  NEED_NEIGHBOR nó -> bootstrapper   {"type","from","exclude":[ids]}   (pedir substituto)
+  ERROR         bootstrapper -> nó   {"type","from","reason"}
+  HELLO         nó <-> vizinho       {"type","from","port"}      (keep-alive)
+  LEAVE         nó -> todos          {"type","from"}
+  MSG           nó -> vizinhos       {"type","from","text"}      (apenas para testes)
+
+FUNÇÕES PARA OS OUTROS MÓDULOS (INTERFACES.md, secção 3)
+  node.send(to, data)          envia bytes ao vizinho com ID 'to'; devolve True/False
+  node.alive_neighbors()       IDs dos vizinhos ativos
+  node.add_down_listener(fn)   fn(id) é chamada quando um vizinho ativo cai (sem HELLO ou LEAVE)
+  node.attach_router(on_receive, types, lock=None)
+                               passa ao router os datagramas "DATA|..." e as mensagens JSON
+                               cujo "type" está em 'types'. on_receive(data) é chamada com
+                               'lock' tomado (o RLock único do nó, ver INTERFACES.md).
 """
 import argparse
 import json
@@ -31,7 +44,7 @@ import sys
 import threading
 import time
 
-BUFFER = 4096
+BUFFER = 65535              # um datagrama de vídeo tem ~1,4 KB; o contrato pede pelo menos 2048
 HELLO_INTERVAL = 2.0        # período dos keep-alives
 DEAD_TIMEOUT = 6.0          # sem HELLO durante este tempo -> vizinho caído
 REREGISTER_INTERVAL = 5.0   # re-registo periódico no bootstrapper
@@ -67,6 +80,11 @@ class Node:
         self.config = None               # só no nó bootstrapper
         self.registry = {}               # só no bootstrapper: id -> {"ip","last"}
 
+        self.ouvintes_queda = []         # funções fn(id) chamadas quando um vizinho ativo cai
+        self.router_hook = None          # on_receive(data) do router (João)
+        self.router_types = set()        # tipos JSON que pertencem ao router
+        self.router_lock = None          # RLock único do nó, partilhado com o router
+
     # ------------------------------------------------------------ utilitários
     def log(self, tag, texto):
         print(f"{time.strftime('%H:%M:%S')} [{self.id}] [{tag}] {texto}", flush=True)
@@ -80,6 +98,50 @@ class Node:
             self.sock.sendto(json.dumps(msg).encode("utf-8"), addr)
         except OSError as e:
             self.log("ERRO", f"falha a enviar {msg.get('type')} para {addr}: {e}")
+
+    # ------------------------------------------------------------ API para o router e o streaming
+    def send(self, to, data):
+        """Envia 'data' (bytes) ao vizinho com ID 'to'. Devolve True se o enviou."""
+        with self.lock:
+            n = self.neighbors.get(to)
+            addr = (n["ip"], n["port"]) if n else None
+        if addr is None:
+            return False
+        try:
+            self.sock.sendto(data, addr)
+            return True
+        except OSError as e:
+            self.log("ERRO", f"falha a enviar {len(data)} bytes para {to} {addr}: {e}")
+            return False
+
+    def alive_neighbors(self):
+        """IDs dos vizinhos que estão ativos (já responderam a HELLO e não caíram)."""
+        with self.lock:
+            return sorted(nid for nid, n in self.neighbors.items() if n["estado"] == "ativo")
+
+    def add_down_listener(self, fn):
+        """Regista fn(id), chamada quando um vizinho que estava ativo cai.
+        É chamada fora do lock da tabela de vizinhos, pelo thread que detetou a queda."""
+        self.ouvintes_queda.append(fn)
+
+    def attach_router(self, on_receive, types, lock=None):
+        """Liga o router: 'DATA|...' e as mensagens JSON com type em 'types' vão para
+        on_receive(data), chamada com 'lock' tomado (por omissão, um RLock novo)."""
+        self.router_hook = on_receive
+        self.router_types = set(types)
+        self.router_lock = lock if lock is not None else threading.RLock()
+
+    def _para_router(self, data):
+        with self.router_lock:
+            self.router_hook(data)
+
+    def _notificar_queda(self, ids):
+        for nid in ids:
+            for fn in list(self.ouvintes_queda):
+                try:
+                    fn(nid)
+                except Exception as e:     # um ouvinte com erro não pode parar o overlay
+                    self.log("ERRO", f"ouvinte de queda falhou para {nid}: {e!r}")
 
     # ------------------------------------------------------------ vizinhos
     def add_neighbor(self, nid, ip, port, origem):
@@ -184,10 +246,11 @@ class Node:
     def on_register(self, msg, addr):
         if not self.config:
             return
-        nid = msg["id"]
+        nid = msg["from"]
         if nid not in self.config["nodes"]:
             self.log("REGISTO", f"rejeitado '{nid}' (ID desconhecido) de {addr[0]}")
-            self.enviar({"type": "ERROR", "motivo": f"ID '{nid}' desconhecido na configuração"}, addr)
+            self.enviar({"type": "ERROR", "from": self.id,
+                         "reason": f"ID '{nid}' desconhecido na configuração"}, addr)
             return
         with self.lock:
             reg = self.registry.get(nid)
@@ -200,29 +263,29 @@ class Node:
                 vizinhos = [self.entrada(v) for v in sorted(self.config["adj"][nid])]
         if duplicado:
             self.log("REGISTO", f"rejeitado '{nid}' de {addr[0]} (ID já ativo noutra máquina)")
-            self.enviar({"type": "ERROR", "motivo": f"ID '{nid}' já está ativo"}, addr)
+            self.enviar({"type": "ERROR", "from": self.id, "reason": f"ID '{nid}' já está ativo"}, addr)
             return
         if not ja_ativo:
             self.log("REGISTO", f"{nid} registado a partir de {addr[0]}")
-        self.enviar({"type": "NEIGHBORS", "motivo": "register", "vizinhos": vizinhos,
-                     "min_degree": self.config["min_degree"]}, addr)
+        self.enviar({"type": "NEIGHBORS", "from": self.id, "reason": "register",
+                     "neighbors": vizinhos, "min_degree": self.config["min_degree"]}, addr)
 
     def on_need_neighbor(self, msg, addr):
         if not self.config:
             return
-        nid = msg["id"]
-        entr = self.escolher_substituto(nid, msg.get("excluir", []))
+        nid = msg["from"]
+        entr = self.escolher_substituto(nid, msg.get("exclude", []))
         if entr:
             self.log("REPARAÇÃO", f"substituto para {nid}: {entr['id']}")
         else:
             self.log("REPARAÇÃO", f"sem substituto disponível para {nid}")
-        self.enviar({"type": "NEIGHBORS", "motivo": "substituto",
-                     "vizinhos": [entr] if entr else [],
+        self.enviar({"type": "NEIGHBORS", "from": self.id, "reason": "replacement",
+                     "neighbors": [entr] if entr else [],
                      "min_degree": self.config["min_degree"]}, addr)
 
     # ------------------------------------------------------------ nó normal
     def send_register(self):
-        self.enviar({"type": "REGISTER", "id": self.id, "porta": self.porta}, self.boot_addr)
+        self.enviar({"type": "REGISTER", "from": self.id, "port": self.porta}, self.boot_addr)
 
     def registo_inicial(self):
         """Tenta registar-se REGISTER_RETRIES vezes. Devolve True se o bootstrapper respondeu."""
@@ -236,9 +299,9 @@ class Node:
         return self.registado.is_set()
 
     def on_neighbors(self, msg, addr):
-        motivo = msg.get("motivo", "register")
+        motivo = msg.get("reason", "register")
         origem = "config" if motivo == "register" else "substituto"
-        vizinhos = msg.get("vizinhos", [])
+        vizinhos = msg.get("neighbors", [])
         for v in vizinhos:
             self.add_neighbor(v["id"], v["ip"], v["port"], origem)
         self.min_degree = msg.get("min_degree", self.min_degree)
@@ -248,19 +311,19 @@ class Node:
             self.log("REPARAÇÃO", "o bootstrapper não tem substituto disponível")
 
     def on_error(self, msg, addr):
-        self.log("ERRO", f"bootstrapper: {msg.get('motivo')}")
-        self.erro_registo = msg.get("motivo", "erro")
+        self.log("ERRO", f"bootstrapper: {msg.get('reason')}")
+        self.erro_registo = msg.get("reason", "erro")
         self.registado.set()
 
     # ------------------------------------------------------------ keep-alive
     def on_hello(self, msg, addr):
-        nid = msg["id"]
+        nid = msg["from"]
         if nid == self.id:
             return
         with self.lock:
             if nid not in self.neighbors:
                 # ligação só declarada do outro lado (assimetria): aprende o vizinho
-                self.add_neighbor(nid, addr[0], msg.get("porta", addr[1]), "aprendido")
+                self.add_neighbor(nid, addr[0], msg.get("port", addr[1]), "aprendido")
             n = self.neighbors[nid]
             n["last"] = time.time()
             if n["estado"] != "ativo":
@@ -268,26 +331,34 @@ class Node:
                 self.log("VIZINHO", f"{nid} ATIVO")
 
     def on_leave(self, msg, addr):
-        nid = msg["id"]
+        nid = msg["from"]
+        caiu = False
         with self.lock:
             n = self.neighbors.get(nid)
             if n and n["estado"] != "caido":
+                caiu = n["estado"] == "ativo"
                 n["estado"] = "caido"
                 self.log("VIZINHO", f"{nid} saiu (LEAVE) -> CAÍDO")
             if self.config:
                 self.registry.pop(nid, None)
+        if caiu:
+            self._notificar_queda([nid])
 
     def on_msg(self, msg, addr):
-        self.log("MSG", f"de {msg.get('id')}: {msg.get('texto')!r}")
+        self.log("MSG", f"de {msg.get('from')}: {msg.get('text')!r}")
 
     def verificar_vizinhos(self):
         agora = time.time()
+        novos_caidos = []
         with self.lock:
             for nid, n in self.neighbors.items():
                 if n["estado"] == "ativo" and agora - n["last"] > DEAD_TIMEOUT:
                     n["estado"] = "caido"
-                    self.log("VIZINHO", f"{nid} sem HELLO há {DEAD_TIMEOUT:.0f}s -> CAÍDO")
+                    novos_caidos.append(nid)
+                    self.log("VIZINHO", f"{nid} sem HELLO há {DEAD_TIMEOUT:g}s -> CAÍDO")
+        self._notificar_queda(novos_caidos)       # fora do lock: o router tem o seu próprio lock
 
+        with self.lock:
             caidos = [i for i, n in self.neighbors.items() if n["estado"] == "caido"]
             validos = sum(1 for n in self.neighbors.values() if n["estado"] != "caido")
             if not caidos or validos >= self.min_degree:
@@ -305,7 +376,7 @@ class Node:
             else:
                 self.log("REPARAÇÃO", "sem substituto disponível")
         elif self.boot_addr:
-            self.enviar({"type": "NEED_NEIGHBOR", "id": self.id, "excluir": excluir}, self.boot_addr)
+            self.enviar({"type": "NEED_NEIGHBOR", "from": self.id, "exclude": excluir}, self.boot_addr)
         else:
             self.log("REPARAÇÃO", "modo manual: sem bootstrapper para pedir substituto")
 
@@ -316,7 +387,7 @@ class Node:
             with self.lock:
                 alvos = [(n["ip"], n["port"]) for n in self.neighbors.values()]
             for a in alvos:
-                self.enviar({"type": "HELLO", "id": self.id, "porta": self.porta}, a)
+                self.enviar({"type": "HELLO", "from": self.id, "port": self.porta}, a)
             self.verificar_vizinhos()
             if self.boot_addr and time.time() - ultimo_reg >= REREGISTER_INTERVAL:
                 self.send_register()
@@ -339,19 +410,29 @@ class Node:
                 dados, addr = self.sock.recvfrom(BUFFER)
             except OSError:
                 break
+            if self.parar.is_set() or addr is None:       # fechar() acordou o recvfrom
+                break
             try:
+                if dados.startswith(b"DATA|"):            # vídeo: segue para o router sem ser lido
+                    if self.router_hook:
+                        self._para_router(dados)
+                    continue
                 msg = json.loads(dados.decode("utf-8"))
-                handler = handlers.get(msg["type"])
+                tipo = msg["type"]
+                if tipo in self.router_types and self.router_hook:
+                    self._para_router(dados)              # ANNOUNCE, ACTIVATE, PING, ...
+                    continue
+                handler = handlers.get(tipo)
             except (ValueError, KeyError, TypeError):
                 self.log("AVISO", f"mensagem inválida de {addr[0]}:{addr[1]}")
                 continue
             if handler is None:
-                self.log("AVISO", f"tipo desconhecido {msg['type']!r} de {addr[0]}")
+                self.log("AVISO", f"tipo desconhecido {tipo!r} de {addr[0]}")
                 continue
             try:
                 handler(msg, addr)
             except Exception as e:  # um pacote mal formado não pode matar o nó
-                self.log("ERRO", f"a tratar {msg['type']} de {addr[0]}: {e!r}")
+                self.log("ERRO", f"a tratar {tipo} de {addr[0]}: {e!r}")
 
     # ------------------------------------------------------------ consola / saída
     def consola(self):
@@ -373,11 +454,10 @@ class Node:
                             print(f"{nid:<10} {'ATIVO' if self.ativo(nid) else 'inativo'}")
                 elif linha.startswith("msg "):
                     texto = linha[4:]
-                    with self.lock:
-                        alvos = [(n["ip"], n["port"]) for n in self.neighbors.values()
-                                 if n["estado"] == "ativo"]
-                    for a in alvos:
-                        self.enviar({"type": "MSG", "id": self.id, "texto": texto}, a)
+                    alvos = self.alive_neighbors()
+                    for nid in alvos:
+                        self.send(nid, json.dumps({"type": "MSG", "from": self.id,
+                                                   "text": texto}).encode("utf-8"))
                     print(f"enviado a {len(alvos)} vizinho(s) ativo(s)")
                 elif linha:
                     print("comando desconhecido")
@@ -387,26 +467,35 @@ class Node:
             self.terminar()
 
     def terminar(self):
-        msg = {"type": "LEAVE", "id": self.id}
+        msg = {"type": "LEAVE", "from": self.id}
         with self.lock:
             alvos = [(n["ip"], n["port"]) for n in self.neighbors.values()]
         for a in alvos:
             self.enviar(msg, a)
         if self.boot_addr:
             self.enviar(msg, self.boot_addr)
-        self.parar.set()
-        self.sock.close()
+        self.fechar()
         print(f"\n[{self.id}] terminado.")
+
+    def fechar(self):
+        """Pára as threads e liberta a porta (sem enviar LEAVE)."""
+        self.parar.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)   # acorda o recvfrom bloqueado na thread de receção
+        except OSError:
+            pass
+        self.sock.close()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Nó overlay OTT (UDP)")
     ap.add_argument("--id", required=True, help="identificador do nó (ex: Node2)")
-    ap.add_argument("--porta", type=int, default=5000, help="porta UDP local (por omissão 5000)")
+    ap.add_argument("--port", "--porta", dest="porta", type=int, default=5000,
+                    help="porta UDP local (por omissão 5000)")
     ap.add_argument("--bootstrapper", metavar="IP:PORTA", help="endereço do bootstrapper")
     ap.add_argument("--config", metavar="FICHEIRO", help="ficheiro de topologia (este nó é o bootstrapper)")
-    ap.add_argument("--vizinhos", nargs="*", default=[], metavar="ID=IP:PORTA",
-                    help="vizinhos manuais (fallback ou modo manual)")
+    ap.add_argument("--neighbors", "--vizinhos", dest="vizinhos", nargs="*", default=[],
+                    metavar="ID=IP:PORTA", help="vizinhos manuais (fallback ou modo manual)")
     args = ap.parse_args()
 
     if args.config and args.bootstrapper:
